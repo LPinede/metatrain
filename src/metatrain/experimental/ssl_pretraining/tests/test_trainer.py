@@ -473,3 +473,84 @@ def test_restart_from_rejects_unknown_versions(tmp_path, version):
             [_dataset()],
             str(tmp_path),
         )
+
+
+class _Recorder:
+    """A test-only term built with the build context; records the step fractions."""
+
+    name = "recorder"
+    needs_gradients = False
+    uses_prediction = False
+    required_targets: dict = {}
+    built: list = []
+
+    def __init__(self, context) -> None:
+        self.context = context
+        self.fractions: list = []
+        _Recorder.built.append(self)
+
+    @classmethod
+    def from_hypers(cls, hypers, context):
+        return cls(context, **hypers)
+
+    def __call__(self, step):
+        self.fractions.append(step.extras["step_fraction"])
+        return step.student_features.sum() * 0.0, {}
+
+
+def test_trainer_passes_the_build_context_and_step_fraction(tmp_path, monkeypatch):
+    monkeypatch.setitem(terms_module.TERMS, "recorder", _Recorder)
+    monkeypatch.setattr(_Recorder, "built", [])
+    hypers = _trainer_hypers(num_epochs=1, num_probes=3)
+    hypers["objective"]["terms"]["recorder"] = {}
+    trainer = Trainer(hypers)
+    model = trainer.setup(small_model_hypers(), INFO)
+    trainer.train(
+        model,
+        torch.float32,
+        [torch.device("cpu")],
+        [_dataset()],
+        [_dataset()],
+        str(tmp_path),
+    )
+    (term,) = _Recorder.built
+    core = model.core
+    n = core.num_readout_layers
+    assert term.context.dims == (n * core.d_node, n * core.d_pet)
+    assert term.context.cutoff == core.requested_neighbor_lists()[0].cutoff
+    assert term.context.atomic_types == ATOMIC_TYPES
+    assert term.context.num_probes == 3
+    n_train = trainer.step
+    assert term.fractions[:n_train] == [i / n_train for i in range(n_train)]
+    assert len(term.fractions) > n_train
+    assert all(f == 1.0 for f in term.fractions[n_train:])
+
+
+def test_training_without_prediction_terms_builds_no_predictor(tmp_path):
+    hypers = _trainer_hypers(num_epochs=1)
+    hypers["objective"]["terms"] = {"vicreg": {"variance": 1.0, "covariance": 0.04}}
+    trainer = Trainer(hypers)
+    model = trainer.setup(small_model_hypers(), INFO)
+    trainer.train(
+        model,
+        torch.float32,
+        [torch.device("cpu")],
+        [_dataset()],
+        [_dataset()],
+        str(tmp_path),
+    )
+    assert trainer.predictor_state_dict is None
+    trainer.save_checkpoint(model, tmp_path / "ssl.ckpt")
+    resumed = Trainer(
+        {**hypers, "num_epochs": 2, "restart_from": str(tmp_path / "ssl.ckpt")}
+    )
+    resumed_model = resumed.setup(small_model_hypers(), INFO)
+    resumed.train(
+        resumed_model,
+        torch.float32,
+        [torch.device("cpu")],
+        [_dataset()],
+        [_dataset()],
+        str(tmp_path),
+    )
+    assert resumed.epoch == 1

@@ -28,9 +28,9 @@ from metatrain.utils.wrapper import MetatrainModel
 from . import checkpoints
 from .backbones import BACKBONES, Backbone
 from .conditioners import build_conditioners
-from .objective import grad_jepa_loss
+from .objective import VIEW_BUILDERS, grad_jepa_loss
 from .predictor import GradJEPAPredictor
-from .terms import build_terms
+from .terms import TermContext, build_terms
 from .views import get_skin_neighbor_list_transform
 
 
@@ -62,6 +62,7 @@ class Trainer(TrainerInterface):
         self.best_model_state_dict: Optional[Dict[str, Any]] = None
         self.best_optimizer_state_dict: Optional[Dict[str, Any]] = None
         self.teacher_state_dict: Optional[Dict[str, Any]] = None
+        # ``None`` when no active term uses the predictor
         self.predictor_state_dict: Optional[Dict[str, Any]] = None
         self.terms_state_dict: Optional[Dict[str, Any]] = None
         # set from the ``backbone`` model hyperparameter in ``setup``
@@ -113,27 +114,36 @@ class Trainer(TrainerInterface):
             self._load_restart_state(hypers["restart_from"], model)
         options = self.backbone.neighbor_list_options(student)
         check_hypers(hypers, options.cutoff)
-        terms = build_terms(hypers["objective"]["terms"])
+        context = TermContext(
+            dims=self.backbone.token_dims(student),
+            cutoff=options.cutoff,
+            atomic_types=list(model.dataset_info.atomic_types),
+            num_probes=hypers["num_probes"],
+        )
+        terms = build_terms(hypers["objective"]["terms"], context)
         ROOT_LOGGER.info("Active loss terms: " + ", ".join(term.name for term in terms))
         # the terms with parameters or state, by name
         term_modules = torch.nn.ModuleDict(
             {term.name: term for term in terms if isinstance(term, torch.nn.Module)}
         )
-        predictor = GradJEPAPredictor(
-            feature_dim=self.backbone.feature_dim(student),
-            hidden_dim=hypers["predictor"]["hidden_dim"],
-            probe_dim=hypers["predictor"]["probe_dim"],
-            num_rbf=hypers["predictor"]["num_rbf"],
-            cutoff=options.cutoff,
-            atomic_types=model.dataset_info.atomic_types,
-            species_query=hypers["predictor"]["species_query"],
-            num_layers=hypers["predictor"]["num_layers"],
-            conditioners=build_conditioners(hypers["predictor"]["conditioners"]),
-        )
+        # the predictor exists only if an active term reads its prediction
+        predictor: Optional[GradJEPAPredictor] = None
+        if any(getattr(term, "uses_prediction", False) for term in terms):
+            predictor = GradJEPAPredictor(
+                feature_dim=self.backbone.feature_dim(student),
+                hidden_dim=hypers["predictor"]["hidden_dim"],
+                probe_dim=hypers["predictor"]["probe_dim"],
+                num_rbf=hypers["predictor"]["num_rbf"],
+                cutoff=options.cutoff,
+                atomic_types=model.dataset_info.atomic_types,
+                species_query=hypers["predictor"]["species_query"],
+                num_layers=hypers["predictor"]["num_layers"],
+                conditioners=build_conditioners(hypers["predictor"]["conditioners"]),
+            )
         teacher = copy.deepcopy(student)
         if self.teacher_state_dict is not None:
             teacher.load_state_dict(self.teacher_state_dict)
-        if self.predictor_state_dict is not None:
+        if predictor is not None and self.predictor_state_dict is not None:
             predictor.load_state_dict(self.predictor_state_dict)
         if self.terms_state_dict is not None:
             term_modules.load_state_dict(self.terms_state_dict)
@@ -141,7 +151,8 @@ class Trainer(TrainerInterface):
         # (PET's ``single_label``) on the CPU: every copy and state load comes
         # first, then everything is moved to the device
         for module in [model, teacher, predictor, term_modules]:
-            module.to(device=device, dtype=dtype)
+            if module is not None:
+                module.to(device=device, dtype=dtype)
         teacher.eval()
         for parameter in teacher.parameters():
             parameter.requires_grad_(False)
@@ -176,11 +187,9 @@ class Trainer(TrainerInterface):
         if len(val_dataloader) == 0:
             raise ValueError("ssl_pretraining needs a non-empty validation set")
 
-        parameters = (
-            list(student.parameters())
-            + list(predictor.parameters())
-            + list(term_modules.parameters())
-        )
+        parameters = list(student.parameters()) + list(term_modules.parameters())
+        if predictor is not None:
+            parameters += list(predictor.parameters())
         optimizer = torch.optim.AdamW(
             parameters, lr=hypers["learning_rate"], weight_decay=hypers["weight_decay"]
         )
@@ -221,6 +230,7 @@ class Trainer(TrainerInterface):
                     hypers,
                     generator,
                     backbone=self.backbone,
+                    step_fraction=self.step / max(1, total_steps),
                 )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, hypers["grad_clip_norm"])
@@ -253,6 +263,7 @@ class Trainer(TrainerInterface):
                     val_generator,
                     with_rank=True,
                     backbone=self.backbone,
+                    step_fraction=1.0,
                 )
                 _accumulate(val_metrics, {"loss": float(loss.detach()), **metrics})
                 n_val += 1
@@ -289,7 +300,9 @@ class Trainer(TrainerInterface):
             self.optimizer_state_dict = optimizer.state_dict()
             self.scheduler_state_dict = lr_scheduler.state_dict()
             self.teacher_state_dict = teacher.state_dict()
-            self.predictor_state_dict = predictor.state_dict()
+            self.predictor_state_dict = (
+                None if predictor is None else predictor.state_dict()
+            )
             self.terms_state_dict = term_modules.state_dict()
             is_last = epoch == hypers["num_epochs"] - 1
             if epoch % hypers["checkpoint_interval"] == 0 or is_last:
@@ -446,6 +459,11 @@ def check_hypers(hypers: Dict[str, Any], cutoff: float) -> None:
         )
     if len(mask["ego_hops"]) == 0 or min(mask["ego_hops"]) < 1:
         raise ValueError("`mask.ego_hops` must be a non-empty list of positive ints")
+    if hypers["views"]["builder"] not in VIEW_BUILDERS:
+        raise ValueError(
+            f"unknown view builder '{hypers['views']['builder']}' (registered: "
+            f"{', '.join(VIEW_BUILDERS)})"
+        )
     if hypers["num_probes"] < 1:
         raise ValueError("`num_probes` must be at least 1")
     if hypers["noise"]["probability"] > 0 and hypers["noise"]["skin"] <= 0:

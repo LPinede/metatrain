@@ -1,7 +1,7 @@
 """The Grad-JEPA objective: view construction, random-scalar gradients and losses."""
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from metatomic.torch import NeighborListOptions, System
@@ -17,18 +17,35 @@ if TYPE_CHECKING:
 
 @dataclass
 class Views:
-    """Student/teacher views of a batch and the per-atom bookkeeping."""
+    """Student/teacher views of a batch and the per-atom bookkeeping.
+
+    Every view builder fills the required fields, which the shared objective reads:
+    the student and teacher systems are encoded, ``rotations`` maps the student
+    gradients back to the teacher frame, and ``masked`` gives the context atoms
+    (``~masked``) of the ``vicreg`` term and of the ``masked_fraction`` and
+    ``rankme`` diagnostics. The optional fields are filled by the Grad-JEPA builder
+    (:func:`build_views`) for its predictor (``displacements``, ``masked``,
+    ``pairs``, ``vectors``) and terms (``latent_targets`` and
+    ``in_masked_structure`` for ``latent``; ``gradient_targets`` and
+    ``in_masked_structure`` for ``gradient``; ``gradient_targets`` for
+    ``gradient_spread``). ``extras`` holds builder-specific data; its key
+    ``"teacher_views"`` (``Dict[str, List[System]]``) names extra teacher views,
+    encoded without gradients by :func:`encode_extra_teacher_views`.
+    """
 
     student: List[System]
     teacher: List[System]
     rotations: torch.Tensor  # (n_atoms, 3, 3), rotation of each atom's system
-    displacements: torch.Tensor  # (n_atoms, 3), teacher-view displacements
     masked: torch.Tensor  # (n_atoms,) bool
-    in_masked_structure: torch.Tensor  # (n_atoms,) bool, atom's structure is masked
-    latent_targets: torch.Tensor  # (n_atoms,) bool
-    gradient_targets: torch.Tensor  # (n_atoms,) bool
-    pairs: torch.Tensor  # (n_pairs, 2) clean pairs below the cutoff, batch-global
-    vectors: torch.Tensor  # (n_pairs, 3) clean pair vectors, teacher frame
+    displacements: Optional[torch.Tensor] = None  # (n_atoms, 3), teacher view
+    # (n_atoms,) bool, atom's structure is masked
+    in_masked_structure: Optional[torch.Tensor] = None
+    latent_targets: Optional[torch.Tensor] = None  # (n_atoms,) bool
+    gradient_targets: Optional[torch.Tensor] = None  # (n_atoms,) bool
+    # (n_pairs, 2) clean pairs below the cutoff, batch-global
+    pairs: Optional[torch.Tensor] = None
+    vectors: Optional[torch.Tensor] = None  # (n_pairs, 3) clean, teacher frame
+    extras: Dict[str, Any] = field(default_factory=dict)  # builder-specific data
 
 
 def build_views(
@@ -196,6 +213,46 @@ def build_views(
     )
 
 
+ViewBuilder = Callable[
+    [List[System], NeighborListOptions, Dict[str, Any], torch.Generator, bool], Views
+]
+"""``(systems, options, hypers, generator, position_gradients) -> Views``."""
+
+VIEW_BUILDERS: Dict[str, ViewBuilder] = {"grad_jepa": build_views}
+"""The view builders, by the ``views.builder`` trainer hyperparameter."""
+
+
+def register_view_builder(name: str, builder: ViewBuilder) -> None:
+    """Register a view builder under ``name`` (idempotent for the same callable).
+
+    :param name: The ``views.builder`` name.
+    :param builder: The builder, with the signature of :func:`build_views`.
+    :raises ValueError: If another builder is registered under ``name``.
+    """
+    if name in VIEW_BUILDERS and VIEW_BUILDERS[name] is not builder:
+        raise ValueError(f"view builder '{name}' is already registered")
+    VIEW_BUILDERS[name] = builder
+
+
+def encode_extra_teacher_views(
+    teacher: torch.nn.Module,
+    extras: Dict[str, Any],
+    backbone: Backbone = BACKBONES["pet"],
+) -> Dict[str, torch.Tensor]:
+    """No-grad per-atom features of every system list in ``extras["teacher_views"]``.
+
+    :param teacher: The EMA teacher core.
+    :param extras: The :attr:`Views.extras` of a view builder.
+    :param backbone: The adapter of the teacher backbone.
+    :return: The detached features, by view name (empty without extra views).
+    """
+    out: Dict[str, torch.Tensor] = {}
+    for name, systems in extras.get("teacher_views", {}).items():
+        with torch.no_grad():
+            out[name] = backbone.features(teacher, systems).detach()
+    return out
+
+
 def sample_probes(
     num_probes: int, dim: int, dtype: torch.dtype, generator: torch.Generator
 ) -> torch.Tensor:
@@ -323,22 +380,30 @@ class StepData:
     # (n_probes, n_atoms, 3), teacher frame; None when no term needs gradients
     student_gradients: Optional[torch.Tensor]
     teacher_gradients: Optional[torch.Tensor]
-    prediction: Dict[str, torch.Tensor]  # "latent", and "gradient" if computed
+    # "latent", and "gradient" if computed; empty when no term uses the predictor
+    prediction: Dict[str, torch.Tensor]
     hypers: Dict[str, Any]
+    # a copy of ``views.extras``, plus "teacher_features" (no-grad features of the
+    # extra teacher views), "step_fraction" (training progress in [0, 1], 1 in
+    # validation), "generator" (the step's random generator) and, with a view
+    # builder other than Grad-JEPA's, "student_tokens" (``HeadInputs`` of the
+    # student view, with gradients)
+    extras: Dict[str, Any] = field(default_factory=dict)
 
 
 def build_step_data(
     student: torch.nn.Module,
     teacher: torch.nn.Module,
-    predictor: torch.nn.Module,
+    predictor: Optional[torch.nn.Module],
     systems: List[System],
     options: NeighborListOptions,
     hypers: Dict[str, Any],
     generator: torch.Generator,
     needs_gradients: bool,
     backbone: Backbone = BACKBONES["pet"],
+    step_fraction: float = 0.0,
 ) -> StepData:
-    """Build the views, encode them and run the predictor.
+    """Build the views, encode them and run the predictor (if given).
 
     Without ``needs_gradients``, the positions do not require grad, the probe
     gradients are not computed, the teacher runs without autograd and the predictor
@@ -347,20 +412,27 @@ def build_step_data(
 
     :param student: Student PET core.
     :param teacher: EMA teacher PET core (in eval mode, no parameter gradients).
-    :param predictor: The :class:`GradJEPAPredictor`.
+    :param predictor: The :class:`GradJEPAPredictor`, or ``None`` to skip it.
     :param systems: Clean systems with the (skin) neighbor list.
     :param options: PET neighbor list options.
     :param hypers: The trainer hypers.
     :param generator: CPU random generator.
     :param needs_gradients: Whether some active term needs the probe gradients.
     :param backbone: The adapter of the student and teacher backbone.
+    :param step_fraction: Training progress in [0, 1] (1 in validation).
     :return: The step data.
     """
-    views = build_views(
-        systems, options, hypers, generator, position_gradients=needs_gradients
-    )
+    builder = hypers["views"]["builder"]
+    views = VIEW_BUILDERS[builder](systems, options, hypers, generator, needs_gradients)
 
-    student_features = backbone.features(student, views.student)
+    extras: Dict[str, Any] = dict(views.extras)
+    if builder == "grad_jepa":
+        student_features = backbone.features(student, views.student)
+    else:
+        # heads of other SSL methods read the backbone tokens
+        student_features, extras["student_tokens"] = backbone.forward_with_tokens(
+            student, views.student
+        )
     probes = sample_probes(
         hypers["num_probes"],
         student_features.shape[1],
@@ -393,7 +465,10 @@ def build_step_data(
         with torch.no_grad():
             teacher_features = backbone.features(teacher, views.teacher)
 
-    types = torch.cat([s.types for s in systems])
+    extras["teacher_features"] = encode_extra_teacher_views(teacher, extras, backbone)
+    extras["step_fraction"] = step_fraction
+    extras["generator"] = generator
+
     step = StepData(
         views=views,
         probes=probes,
@@ -403,19 +478,22 @@ def build_step_data(
         teacher_gradients=teacher_gradients,
         prediction={},  # set below: the conditioners read the rest of the step
         hypers=hypers,
+        extras=extras,
     )
-    with torch.set_grad_enabled(student.training):
-        step.prediction = predictor(
-            student_features,
-            student_gradients,
-            probes,
-            views.displacements,
-            types,
-            views.masked,
-            views.pairs,
-            views.vectors,
-            step,
-        )
+    if predictor is not None:
+        types = torch.cat([s.types for s in systems])
+        with torch.set_grad_enabled(student.training):
+            step.prediction = predictor(
+                student_features,
+                student_gradients,
+                probes,
+                views.displacements,
+                types,
+                views.masked,
+                views.pairs,
+                views.vectors,
+                step,
+            )
     return step
 
 
@@ -423,10 +501,10 @@ RESERVED_DIAGNOSTICS = ("loss", "masked_fraction", "rankme")
 """Metric names set by the objective and the trainer, not usable by the terms."""
 
 
-def grad_jepa_loss(
+def grad_jepa_term_losses(
     student: torch.nn.Module,
     teacher: torch.nn.Module,
-    predictor: torch.nn.Module,
+    predictor: Optional[torch.nn.Module],
     terms: Sequence["Term"],
     systems: List[System],
     options: NeighborListOptions,
@@ -434,14 +512,17 @@ def grad_jepa_loss(
     generator: torch.Generator,
     with_rank: bool = False,
     backbone: Backbone = BACKBONES["pet"],
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Compute the Grad-JEPA loss of one batch: the sum of the active terms.
+    step_fraction: float = 0.0,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
+    """Compute the (weighted) loss of every active term on one batch.
 
-    The probe gradients are computed only if some term needs them.
+    The probe gradients are computed only if some term needs them, and the
+    predictor runs only if some term uses its prediction (a term without the
+    ``uses_prediction`` attribute does not).
 
     :param student: Student PET core (in training mode).
     :param teacher: EMA teacher PET core (in eval mode, no parameter gradients).
-    :param predictor: The :class:`GradJEPAPredictor`.
+    :param predictor: The :class:`GradJEPAPredictor` (``None`` if no term uses it).
     :param terms: The active loss terms (see :func:`terms.build_terms`).
     :param systems: Clean systems with the (skin) neighbor list.
     :param options: PET neighbor list options.
@@ -449,39 +530,84 @@ def grad_jepa_loss(
     :param generator: CPU random generator.
     :param with_rank: Also report the RankMe of (at most 4096) student features.
     :param backbone: The adapter of the student and teacher backbone.
-    :return: The loss and a dictionary of scalar diagnostics.
+    :param step_fraction: Training progress in [0, 1] (1 in validation).
+    :return: The loss of each term, by name and in the order of ``terms``, and a
+        dictionary of scalar diagnostics.
+    :raises ValueError: Without terms, or without a predictor for a term using it.
     """
     if len(terms) == 0:
         raise ValueError("the objective needs at least one loss term")
+    uses_prediction = any(getattr(term, "uses_prediction", False) for term in terms)
+    if uses_prediction and predictor is None:
+        raise ValueError("an active loss term uses the predictor, but none is given")
     step = build_step_data(
         student,
         teacher,
-        predictor,
+        predictor if uses_prediction else None,
         systems,
         options,
         hypers,
         generator,
         needs_gradients=any(term.needs_gradients for term in terms),
         backbone=backbone,
+        step_fraction=step_fraction,
     )
 
-    losses = []
+    losses: Dict[str, torch.Tensor] = {}
     metrics: Dict[str, torch.Tensor] = {}
     for term in terms:
+        if term.name in losses:
+            raise ValueError(f"two active loss terms are named '{term.name}'")
         term_loss, diagnostics = term(step)
-        losses.append(term_loss)
+        losses[term.name] = term_loss
         for name, value in diagnostics.items():
             if name in RESERVED_DIAGNOSTICS:
                 raise ValueError(f"diagnostic name '{name}' is reserved")
             if name in metrics:
                 raise ValueError(f"diagnostic '{name}' is reported by two terms")
             metrics[name] = value
-    loss = losses[0]
-    for term_loss in losses[1:]:
-        loss = loss + term_loss
 
     context = ~step.views.masked
     metrics["masked_fraction"] = step.views.masked.cpu().double().mean()
     if with_rank:
         metrics["rankme"] = rankme(step.student_features[context][:4096])
-    return loss, {name: float(value.detach()) for name, value in metrics.items()}
+    return losses, {name: float(value.detach()) for name, value in metrics.items()}
+
+
+def grad_jepa_loss(
+    student: torch.nn.Module,
+    teacher: torch.nn.Module,
+    predictor: Optional[torch.nn.Module],
+    terms: Sequence["Term"],
+    systems: List[System],
+    options: NeighborListOptions,
+    hypers: Dict[str, Any],
+    generator: torch.Generator,
+    with_rank: bool = False,
+    backbone: Backbone = BACKBONES["pet"],
+    step_fraction: float = 0.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Compute the loss of one batch: the sum of the active terms.
+
+    See :func:`grad_jepa_term_losses` for the parameters.
+
+    :return: The loss and a dictionary of scalar diagnostics.
+    """
+    losses, metrics = grad_jepa_term_losses(
+        student,
+        teacher,
+        predictor,
+        terms,
+        systems,
+        options,
+        hypers,
+        generator,
+        with_rank=with_rank,
+        backbone=backbone,
+        step_fraction=step_fraction,
+    )
+    values = list(losses.values())
+    loss = values[0]
+    for term_loss in values[1:]:
+        loss = loss + term_loss
+    return loss, metrics

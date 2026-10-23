@@ -15,6 +15,7 @@ from metatrain.experimental.ssl_pretraining.objective import (
 )
 from metatrain.experimental.ssl_pretraining.terms import (
     TERMS,
+    TermContext,
     build_terms,
     register_term,
 )
@@ -25,6 +26,8 @@ from . import CARBON_PATH, QM9_PATH
 from .test_objective import _setup
 
 
+# the Grad-JEPA terms; other SSL methods register more terms after them
+GRAD_JEPA_TERMS = ["latent", "gradient", "vicreg", "gradient_spread"]
 LATENT_ONLY = {
     "latent": {"weight": 1.0},
     "vicreg": {"variance": 1.0, "covariance": 0.04},
@@ -124,11 +127,11 @@ def _architecture_options(terms_hypers):
 
 
 def test_registry_matches_the_hypers():
-    assert list(TERMS) == ["latent", "gradient", "vicreg", "gradient_spread"]
-    # every registered term has its hypers entry (and nothing else has one)
-    assert set(TermsHypers.__annotations__) == set(TERMS)
-    for name, cls in TERMS.items():
-        assert cls.name == name
+    assert list(TERMS)[: len(GRAD_JEPA_TERMS)] == GRAD_JEPA_TERMS
+    # every Grad-JEPA term has its hypers entry
+    assert set(GRAD_JEPA_TERMS) <= set(TermsHypers.__annotations__)
+    for name in GRAD_JEPA_TERMS:
+        assert TERMS[name].name == name
 
 
 def test_needs_gradients():
@@ -184,6 +187,36 @@ def test_register_term(monkeypatch):
         register_term(Constant)
 
 
+def test_build_context_reaches_from_hypers_terms(monkeypatch):
+    monkeypatch.setattr(terms, "TERMS", dict(TERMS))
+
+    @register_term
+    class WithContext:
+        name = "with_context"
+        needs_gradients = False
+        uses_prediction = False
+
+        def __init__(self, weight: float, context: TermContext) -> None:
+            self.weight = weight
+            self.context = context
+            self.required_targets: dict = {}
+
+        @classmethod
+        def from_hypers(cls, hypers, context):
+            return cls(context=context, **hypers)
+
+        def __call__(self, step):
+            return step.student_features.sum() * 0.0, {}
+
+    context = TermContext(dims=(32, 32), cutoff=4.0, atomic_types=[1, 6], num_probes=8)
+    active = build_terms({**LATENT_ONLY, "with_context": {"weight": 2.0}}, context)
+    assert [t.name for t in active] == ["latent", "vicreg", "with_context"]
+    assert active[-1].weight == 2.0
+    assert active[-1].context is context
+    with pytest.raises(ValueError, match="needs the build context"):
+        build_terms({"with_context": {"weight": 2.0}})
+
+
 @pytest.mark.parametrize("name", list(GOLDEN))
 def test_behaviour_preservation(name):
     """The default terms reproduce the pre-refactor objective exactly."""
@@ -208,7 +241,7 @@ def test_behaviour_preservation(name):
         torch.testing.assert_close(metrics[key], value, rtol=1e-10, atol=1e-12)
 
 
-@pytest.mark.parametrize("name", list(TERMS))
+@pytest.mark.parametrize("name", GRAD_JEPA_TERMS)
 def test_term_contract(name):
     """Each term alone: finite on degenerate batches, trains the student only."""
     frames = [

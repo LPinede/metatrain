@@ -65,6 +65,13 @@ class Backbone(Protocol):
         :return: The feature dimension.
         """
 
+    def token_dims(self, core: torch.nn.Module) -> Tuple[int, int]:
+        """The node and edge token dimensions (:attr:`HeadInputs.dims`).
+
+        :param core: The backbone core.
+        :return: ``(Dn, De)``.
+        """
+
     def neighbor_list_options(self, core: torch.nn.Module) -> NeighborListOptions:
         """The neighbor list the backbone reads.
 
@@ -145,6 +152,10 @@ class PETBackbone:
 
     def feature_dim(self, core: torch.nn.Module) -> int:
         return int(core.num_readout_layers * (core.d_node + core.d_pet))
+
+    def token_dims(self, core: torch.nn.Module) -> Tuple[int, int]:
+        n = int(core.num_readout_layers)
+        return n * int(core.d_node), n * int(core.d_pet)
 
     def neighbor_list_options(self, core: torch.nn.Module) -> NeighborListOptions:
         return core.requested_neighbor_lists()[0]

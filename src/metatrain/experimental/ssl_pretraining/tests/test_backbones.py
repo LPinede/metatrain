@@ -28,6 +28,12 @@ def test_features_have_feature_dim(pet_core, small_batch):
     assert features.shape == (n_atoms, PET.feature_dim(pet_core))
 
 
+def test_token_dims(pet_core, small_batch):
+    systems, _, _ = small_batch
+    _, tokens = PET.forward_with_tokens(pet_core, systems)
+    assert PET.token_dims(pet_core) == tokens.dims
+
+
 def test_neighbor_list_options(pet_core):
     options = PET.neighbor_list_options(pet_core)
     assert options == pet_core.requested_neighbor_lists()[0]

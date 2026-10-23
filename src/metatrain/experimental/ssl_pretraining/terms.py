@@ -1,7 +1,9 @@
 """Registry of the named loss terms of the Grad-JEPA objective.
 
 A term is a class with the attributes of :class:`Term`, constructed from its hypers
-(``cls(**hypers)``, the entry of ``objective.terms`` under its name) and called on
+(the entry of ``objective.terms`` under its name) with ``cls(**hypers)`` or, if the
+class defines it, ``cls.from_hypers(hypers, context)``, where ``context`` is the
+:class:`TermContext` of the run, and called on
 the :class:`StepData` of every batch. It returns its already weighted loss and its
 diagnostics. New terms are added with :func:`register_term`, together with their
 hypers ``TypedDict`` as a ``NotRequired[Optional[...]]`` entry of ``TermsHypers``
@@ -17,6 +19,7 @@ student's optimizer (and gradient clipping), switches it between ``train()`` and
 under the term's name in the checkpoint (``grad_jepa.terms_state_dict``).
 """
 
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, TypeVar
 
 import torch
@@ -35,11 +38,24 @@ class Term(Protocol):
 
     name: str
     needs_gradients: bool  # requires the probe gradients (double backward)
+    # reads ``step.prediction``: the predictor is built and run only if an active
+    # term sets it (a term without the attribute is taken not to)
+    uses_prediction: bool
     required_targets: dict  # labels it consumes (empty for label-free terms)
 
     def __call__(self, step: StepData) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Return the (already weighted) loss and the diagnostics."""
         ...
+
+
+@dataclass
+class TermContext:
+    """What a term may need at construction beyond its hypers."""
+
+    dims: Tuple[int, int]  # (node, edge) token dimensions of the backbone
+    cutoff: float  # the backbone cutoff
+    atomic_types: List[int]  # the atomic types of the dataset
+    num_probes: int  # the ``num_probes`` trainer hyperparameter
 
 
 TERMS: Dict[str, Callable[..., Term]] = {}
@@ -62,13 +78,18 @@ def register_term(cls: T) -> T:
     return cls
 
 
-def build_terms(terms_hypers: Dict[str, Optional[Dict[str, Any]]]) -> List[Term]:
+def build_terms(
+    terms_hypers: Dict[str, Optional[Dict[str, Any]]],
+    context: Optional[TermContext] = None,
+) -> List[Term]:
     """Build the active terms, in registration order.
 
     :param terms_hypers: ``objective.terms``: hypers by term name; absent or
         ``None`` terms are disabled.
+    :param context: The build context, passed to the terms with ``from_hypers``.
     :return: The active terms.
-    :raises ValueError: On an unknown term name or if no term is active.
+    :raises ValueError: On an unknown term name, if no term is active, or if an
+        active term needs the build context and none is given.
     """
     for name in terms_hypers:
         if name not in TERMS:
@@ -78,8 +99,15 @@ def build_terms(terms_hypers: Dict[str, Optional[Dict[str, Any]]]) -> List[Term]
     terms = []
     for name, cls in TERMS.items():
         hypers = terms_hypers.get(name)
-        if hypers is not None:
+        if hypers is None:
+            continue
+        from_hypers = getattr(cls, "from_hypers", None)
+        if from_hypers is None:
             terms.append(cls(**hypers))
+        elif context is None:
+            raise ValueError(f"loss term '{name}' needs the build context")
+        else:
+            terms.append(from_hypers(hypers, context))
     if len(terms) == 0:
         raise ValueError("`objective.terms` must enable at least one loss term")
     return terms
@@ -94,6 +122,7 @@ class LatentTerm:
 
     name = "latent"
     needs_gradients = False
+    uses_prediction = True
 
     def __init__(self, weight: float) -> None:
         self.weight = weight
@@ -102,6 +131,8 @@ class LatentTerm:
     def __call__(self, step: StepData) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         views = step.views
         prediction = step.prediction["latent"]
+        assert views.latent_targets is not None
+        assert views.in_masked_structure is not None
         masked = views.latent_targets & views.in_masked_structure
         unmasked = views.latent_targets & ~views.in_masked_structure
         loss_masked = latent_loss(prediction, step.teacher_features, masked)
@@ -120,6 +151,7 @@ class GradientTerm:
 
     name = "gradient"
     needs_gradients = True
+    uses_prediction = True
 
     def __init__(self, weight: float) -> None:
         self.weight = weight
@@ -130,6 +162,8 @@ class GradientTerm:
         prediction = step.prediction["gradient"]
         target = step.teacher_gradients
         assert target is not None
+        assert views.gradient_targets is not None
+        assert views.in_masked_structure is not None
         masked = views.gradient_targets & views.in_masked_structure
         unmasked = views.gradient_targets & ~views.in_masked_structure
         loss_masked = normalized_gradient_loss(prediction, target, masked)
@@ -162,6 +196,7 @@ class VICRegTerm:
 
     name = "vicreg"
     needs_gradients = False
+    uses_prediction = False
 
     def __init__(self, variance: float, covariance: float) -> None:
         self.variance = variance
@@ -184,6 +219,7 @@ class GradientSpreadTerm:
 
     name = "gradient_spread"
     needs_gradients = True
+    uses_prediction = True
 
     def __init__(self, weight: float, floor: float) -> None:
         self.weight = weight
@@ -193,6 +229,7 @@ class GradientSpreadTerm:
     def __call__(self, step: StepData) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         gradients = step.student_gradients
         assert gradients is not None
+        assert step.views.gradient_targets is not None
         atoms = ~step.views.masked & step.views.gradient_targets
         if int(atoms.sum()) >= 2:
             spread = relative_gradient_spread(

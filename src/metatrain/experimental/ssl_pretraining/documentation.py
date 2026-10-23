@@ -212,6 +212,14 @@ class PredictorHypers(TypedDict):
     """Whether the predictor knows the species of the masked atoms."""
 
 
+class ViewsHypers(TypedDict):
+    """Construction of the student and teacher views."""
+
+    builder: str = "grad_jepa"
+    """Registered view builder (``objective.VIEW_BUILDERS``). ``grad_jepa``: a
+    rotated, masked student view and a displaced teacher view."""
+
+
 class TrainerHypers(TypedDict):
     """Hyperparameters for the Grad-JEPA trainer."""
 
@@ -259,6 +267,8 @@ class TrainerHypers(TypedDict):
     teacher view."""
     num_probes: int = 2
     """Number of random probe vectors per step."""
+    views: ViewsHypers = init_with_defaults(ViewsHypers)
+    """Construction of the views."""
     noise: NoiseHypers = init_with_defaults(NoiseHypers)
     """Displacements of the teacher view."""
     mask: MaskHypers = init_with_defaults(MaskHypers)
