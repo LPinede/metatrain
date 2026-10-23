@@ -1,7 +1,7 @@
 """Per-block heads on learned tokens, an invariant one-step context module, and block
 normalization."""
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Union
 
 import torch
 
@@ -117,9 +117,12 @@ class BlockNormalizer(torch.nn.Module):
         return max(self.var.get(name, 1.0), self.floor) ** 0.5
 
 
-def batch_variance_floor(pred: torch.Tensor, gamma: float) -> torch.Tensor:
+def batch_variance_floor(
+    pred: torch.Tensor, gamma: Union[float, torch.Tensor]
+) -> torch.Tensor:
     """``relu(gamma - std over the batch)`` per component, averaged; per batch, not per
-    atom."""
+    atom. ``gamma`` is a level shared by every component, or one level per component
+    (shape ``pred.shape[1:]``)."""
     if pred.shape[0] < 2:
         return pred.new_zeros(())
     return torch.relu(gamma - pred.std(dim=0)).mean()

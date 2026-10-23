@@ -232,7 +232,8 @@ def test_jet_targets_transform_as_their_blocks():
 
 def test_loss_is_weighted_mean_of_normalized_block_losses_plus_floor(step_data):
     """Zero predictions: each block costs mean(t^2) / var(t) (fresh EMA), and every
-    l > 0 block pays the full floor 0.1 (A only)."""
+    component c of an l > 0 block pays its own floor 0.1 std_n(t_c), in units of
+    the block scale (A only): components whose target never varies cost nothing."""
     gamma, weight, l_max = 0.5, 2.0, 2
     term = ResidualMultipoleTerm(
         _dims(step_data), l_max, 4, N_SPECIES, CUTOFF, 32, weight, gamma
@@ -244,9 +245,27 @@ def test_loss_is_weighted_mean_of_normalized_block_losses_plus_floor(step_data):
     blocks = torch.stack(
         [t.pow(2).mean() / t.var(unbiased=False) for t in targets.values()]
     )
+    floor = sum(
+        (
+            0.1 * targets[f"l{l}"].std(dim=0) / targets[f"l{l}"].std(unbiased=False)
+        ).mean()
+        for l in range(1, l_max + 1)
+    )
+    # nearly dead components exist: a shared level would force fake spread there
+    spread = targets["l1"].std(dim=0)
+    assert spread.min() < 0.01 * spread.max()
     loss, _ = term(step_data)
-    expected = weight * (blocks.mean() + gamma * 0.1 * l_max)
+    expected = weight * (blocks.mean() + gamma * floor)
     torch.testing.assert_close(loss.detach(), expected.to(loss))
+
+
+def test_floor_vanishes_when_predictions_spread_like_the_targets(step_data):
+    """Predictions equal to the targets pay neither the block loss nor the floor."""
+    term = _multipole(step_data, l_max=2, floor_gamma=1.0)
+    targets = term.teacher_frame_targets(step_data)
+    term.predict = lambda step: {k: v.clone() for k, v in targets.items()}
+    loss, _ = term(step_data)
+    assert float(loss) == pytest.approx(0.0, abs=1e-6)
 
 
 def test_degenerate_batches_are_finite(tiny_step_data):

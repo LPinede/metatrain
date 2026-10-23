@@ -28,7 +28,8 @@ MIN_CHIRALITY_NEIGHBORS = 3
 """Minimum number of neighbours within the cutoff of a chirality site."""
 
 FLOOR_LEVEL = 0.1
-"""Level of the per-batch variance floor, in target standard deviations."""
+"""Level of the per-batch variance floor of each component, in standard deviations
+of that component's target."""
 
 MIN_TARGET_VARIANCE = 1e-8
 """Batch variance of a block's targets (target units squared) below which the block
@@ -182,10 +183,15 @@ class ResidualMultipoleTerm(torch.nn.Module):
             for block in preds
         ]
         loss = torch.stack(losses).mean()
-        # scale-free per-batch floor on the l > 0 predictions
+        # per-batch floor on the l > 0 predictions, per component and relative to
+        # the target's spread (components whose target never varies cost nothing),
+        # in units of the block scale
         for l in range(1, self.l_max + 1):
-            pred = preds[f"l{l}"] / self.norm.scale(names[f"l{l}"])
-            loss = loss + self.floor_gamma * batch_variance_floor(pred, FLOOR_LEVEL)
+            scale = self.norm.scale(names[f"l{l}"])
+            pred, target = preds[f"l{l}"] / scale, targets[f"l{l}"] / scale
+            if target.shape[0] >= 2:
+                level = FLOOR_LEVEL * target.std(dim=0)
+                loss = loss + self.floor_gamma * batch_variance_floor(pred, level)
         diag[f"{self.name}/loss"] = loss.detach()
         return self.weight * loss, diag
 
