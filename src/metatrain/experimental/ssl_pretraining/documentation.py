@@ -44,6 +44,8 @@ from typing_extensions import NotRequired, TypedDict
 from metatrain.pet.documentation import ModelHypers as PETModelHypers
 from metatrain.utils.hypers import init_with_defaults
 
+from .high_order.documentation import HighOrderHypers
+
 
 class ModelHypers(PETModelHypers):
     """The backbone choice; the other model hyperparameters are the backbone's."""
@@ -217,7 +219,9 @@ class ViewsHypers(TypedDict):
 
     builder: str = "grad_jepa"
     """Registered view builder (``objective.VIEW_BUILDERS``). ``grad_jepa``: a
-    rotated, masked student view and a displaced teacher view."""
+    rotated, masked student view and a displaced teacher view. ``high_order``: a
+    rotated student view, masked or deformed, and a teacher view deformed by
+    windowed l=1 modes (see ``high_order``)."""
 
 
 class TrainerHypers(TypedDict):
@@ -277,3 +281,5 @@ class TrainerHypers(TypedDict):
     """Predictor hyperparameters."""
     objective: ObjectiveHypers = init_with_defaults(ObjectiveHypers)
     """The loss terms and their weights."""
+    high_order: HighOrderHypers = init_with_defaults(HighOrderHypers)
+    """The high-order SSL method (views, targets and loss balancing)."""

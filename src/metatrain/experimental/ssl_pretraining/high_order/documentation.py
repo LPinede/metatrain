@@ -1,0 +1,113 @@
+"""Hyperparameters of the high-order SSL method (``training.high_order``).
+
+This module is the single source of the defaults. It must stay torch-free: the
+shared ``documentation.py`` imports it.
+"""
+
+from typing import Annotated, Literal
+
+from pydantic import AfterValidator
+from typing_extensions import TypedDict
+
+
+def _probability(value: float) -> float:
+    if not 0.0 <= value <= 1.0:
+        raise ValueError("must lie in [0, 1]")
+    return value
+
+
+def _fraction(value: float) -> float:
+    if not 0.0 < value <= 1.0:
+        raise ValueError("must lie in (0, 1]")
+    return value
+
+
+def _positive(value: float) -> float:
+    if not value > 0:
+        raise ValueError("must be positive")
+    return value
+
+
+def _non_negative(value: float) -> float:
+    if value < 0:
+        raise ValueError("must be non-negative")
+    return value
+
+
+def _not_empty(value: list) -> list:
+    if len(value) == 0:
+        raise ValueError("must not be empty")
+    return value
+
+
+Probability = Annotated[float, AfterValidator(_probability)]
+PositiveFloat = Annotated[float, AfterValidator(_positive)]
+NonNegativeFloat = Annotated[float, AfterValidator(_non_negative)]
+PositiveInt = Annotated[int, AfterValidator(_positive)]
+NonNegativeInt = Annotated[int, AfterValidator(_non_negative)]
+
+
+class HighOrderHypers(TypedDict):
+    """Views, targets and loss balancing of the high-order SSL method (used with
+    ``views.builder: high_order``)."""
+
+    p_def: Probability = 0.5
+    """Probability that a structure takes the deform-only student branch (else the
+    mask-only branch, masked as in Grad-JEPA through ``mask``)."""
+    field_amplitude: PositiveFloat = 0.15
+    """Amplitude (length units) of the smooth random displacement field of the
+    deform-only branch."""
+    wavelength: PositiveFloat = 8.0
+    """Wavelength (length units) of the plane waves of the smooth field of
+    non-periodic structures."""
+    n_waves: PositiveInt = 6
+    """Number of plane waves of the smooth field of non-periodic structures."""
+    max_wave_index: PositiveInt = 2
+    """Periodic structures: the wave vectors of the smooth field are reciprocal
+    lattice vectors with integer indices in ``[-max_wave_index, max_wave_index]``."""
+    iid_sigma: NonNegativeFloat = 0.03
+    """Standard deviation (per Cartesian component, length units) of the iid
+    per-atom noise added to the smooth field."""
+    mode_amplitude: PositiveFloat = 0.05
+    """Standard deviation of the 9 amplitudes (dilation, rotation, shear) of the
+    windowed l=1 teacher modes at each centre."""
+    mode_window: PositiveFloat = 3.0
+    """Width (length units) of the Gaussian window of the teacher modes."""
+    max_centers: PositiveInt = 4
+    """Maximum number of teacher-mode centres per structure."""
+    teacher_pair: bool = True
+    """Whether the teacher runs on the antithetic pair ``x0 ± u_T`` (else on
+    ``x0 + u_T`` only, with the clean ``x0`` as the reference)."""
+    l_max_multipole: NonNegativeInt = 4
+    """Highest order of the residual multipole targets."""
+    l_max_latent: NonNegativeInt = 4
+    """Highest order of the rotation-conditioned latent prediction."""
+    n_radial: PositiveInt = 6
+    """Number of radial channels of the residual multipole targets."""
+    analytic_weight: NonNegativeFloat = 1.0
+    """Weight of the analytic terms (residual multipoles, deformation jets,
+    chirality)."""
+    teacher_weight: NonNegativeFloat = 1.0
+    """Weight of the teacher terms (rotation-conditioned latent, action response)."""
+    warmup_fraction: Probability = 0.05
+    """Fraction of the steps during which only the invariant part of the latent term
+    is active and the action-response term is off."""
+    floor_gamma: NonNegativeFloat = 0.1
+    """Variance floor of the l > 0 predictions, in units of the target standard
+    deviation of each block."""
+    chirality_weight: NonNegativeFloat = 0.1
+    """Weight of the chirality term relative to ``analytic_weight``."""
+    chirality_types: Annotated[list[int], AfterValidator(_not_empty)] = [1, 6, 8]
+    """Atomic types of the chirality channels."""
+    head_inputs: Literal["node", "node_edge"] = "node"
+    """Inputs of the per-block heads: the pooled per-atom feature (``node``), or a
+    node part plus a per-edge part summed over neighbours (``node_edge``)."""
+    anchor_channel_fraction: Annotated[float, AfterValidator(_fraction)] = 1.0
+    """Fraction of the token channels read by the heads of the analytic terms."""
+    anti_collapse: Literal["vicreg", "sigreg", "vicreg_averaged", "none"] = "vicreg"
+    """Anti-collapse term (``none`` only for the design pilots)."""
+    second_rotation: bool = False
+    """Whether a second student rotation is encoded (equivariant or averaged
+    VICReg)."""
+    equivariant_vicreg_weight: NonNegativeFloat = 0.1
+    """Weight of the equivariant VICReg term (with ``second_rotation``)."""
