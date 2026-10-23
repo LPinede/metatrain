@@ -195,3 +195,20 @@ def test_collate_global_augmentation(augment):
             torch.cdist(train[0].positions, train[0].positions),
             torch.cdist(systems[0].positions, systems[0].positions),
         )
+
+
+def test_train_latent_only(tmp_path):
+    torch.manual_seed(0)
+    dataset = _dataset()
+    hypers = _trainer_hypers(num_epochs=1)
+    hypers["objective"]["terms"] = {
+        "latent": {"weight": 1.0},
+        "vicreg": {"variance": 1.0, "covariance": 0.04},
+    }
+    trainer = Trainer(hypers)
+    model = trainer.setup(small_model_hypers(), INFO)
+    trainer.train(
+        model, torch.float32, [torch.device("cpu")], [dataset], [dataset], str(tmp_path)
+    )
+    assert trainer.epoch == 0
+    assert (tmp_path / "model_0.ckpt").exists()

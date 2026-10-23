@@ -1,7 +1,7 @@
 """The Grad-JEPA objective: view construction, random-scalar gradients and losses."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from metatomic.torch import ModelOutput, NeighborListOptions, System
@@ -9,6 +9,9 @@ from metatomic.torch import ModelOutput, NeighborListOptions, System
 from .masking import boundary_atoms, k_hop_ego_region, nl_ball_region
 from .views import bounded_noise, build_view, pair_vectors, random_rotations
 
+
+if TYPE_CHECKING:
+    from .terms import Term
 
 FEATURE_OUTPUT = {"feature": ModelOutput(sample_kind="atom")}
 
@@ -34,6 +37,7 @@ def build_views(
     options: NeighborListOptions,
     hypers: Dict[str, Any],
     generator: torch.Generator,
+    position_gradients: bool = True,
 ) -> Views:
     """Sample a rotation, a displacement field and a mask for every system.
 
@@ -46,6 +50,7 @@ def build_views(
     :param options: PET neighbor list options.
     :param hypers: The trainer hypers.
     :param generator: CPU random generator driving all sampling.
+    :param position_gradients: Whether the positions of the views require grad.
     :return: The views.
     """
     dtype = systems[0].positions.dtype
@@ -90,7 +95,7 @@ def build_views(
             build_view(
                 system,
                 options,
-                (system.positions + delta).detach().requires_grad_(True),
+                (system.positions + delta).detach().requires_grad_(position_gradients),
                 system.cell,
             )
         )
@@ -143,7 +148,9 @@ def build_views(
             build_view(
                 system,
                 options,
-                (system.positions @ rotation.T).detach().requires_grad_(True),
+                (system.positions @ rotation.T)
+                .detach()
+                .requires_grad_(position_gradients),
                 system.cell @ rotation.T,
                 keep_pairs=keep,
             )
@@ -305,7 +312,22 @@ def rankme(features: torch.Tensor) -> torch.Tensor:
     return torch.exp(-(p * torch.log(p)).sum())
 
 
-def grad_jepa_loss(
+@dataclass
+class StepData:
+    """Everything the loss terms of one batch can read."""
+
+    views: Views
+    probes: torch.Tensor  # (n_probes, D)
+    student_features: torch.Tensor  # (n_atoms, D)
+    teacher_features: torch.Tensor  # (n_atoms, D), detached
+    # (n_probes, n_atoms, 3), teacher frame; None when no term needs gradients
+    student_gradients: Optional[torch.Tensor]
+    teacher_gradients: Optional[torch.Tensor]
+    prediction: Dict[str, torch.Tensor]  # "latent", and "gradient" if computed
+    hypers: Dict[str, Any]
+
+
+def build_step_data(
     student: torch.nn.Module,
     teacher: torch.nn.Module,
     predictor: torch.nn.Module,
@@ -313,22 +335,28 @@ def grad_jepa_loss(
     options: NeighborListOptions,
     hypers: Dict[str, Any],
     generator: torch.Generator,
-    with_rank: bool = False,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Compute the full Grad-JEPA loss for one batch.
+    needs_gradients: bool,
+) -> StepData:
+    """Build the views, encode them and run the predictor.
 
-    :param student: Student PET core (in training mode).
+    Without ``needs_gradients``, the positions do not require grad, the probe
+    gradients are not computed, the teacher runs without autograd and the predictor
+    returns only ``latent``. The random stream (views, then probes) is the same in
+    both modes.
+
+    :param student: Student PET core.
     :param teacher: EMA teacher PET core (in eval mode, no parameter gradients).
     :param predictor: The :class:`GradJEPAPredictor`.
     :param systems: Clean systems with the (skin) neighbor list.
     :param options: PET neighbor list options.
     :param hypers: The trainer hypers.
     :param generator: CPU random generator.
-    :param with_rank: Also report the RankMe of (at most 4096) student features.
-    :return: The loss and a dictionary of scalar diagnostics.
+    :param needs_gradients: Whether some active term needs the probe gradients.
+    :return: The step data.
     """
-    views = build_views(systems, options, hypers, generator)
-    weights = hypers["loss_weights"]
+    views = build_views(
+        systems, options, hypers, generator, position_gradients=needs_gradients
+    )
 
     student_features = student(views.student, FEATURE_OUTPUT)["feature"].block().values
     probes = sample_probes(
@@ -337,24 +365,35 @@ def grad_jepa_loss(
         student_features.dtype,
         generator,
     ).to(student_features.device)
-    # the graph of the gradients is only needed to train the student
-    student_gradients = random_scalar_gradients(
-        student_features,
-        [s.positions for s in views.student],
-        probes,
-        create_graph=student.training,
-    )
-    # back to the teacher frame: x' = x R^T  =>  dL/dx = dL/dx' R
-    student_gradients = torch.einsum("pni,nij->pnj", student_gradients, views.rotations)
 
-    teacher_features = teacher(views.teacher, FEATURE_OUTPUT)["feature"].block().values
-    teacher_gradients = random_scalar_gradients(
-        teacher_features,
-        [s.positions for s in views.teacher],
-        probes,
-        create_graph=False,
-    )
-    teacher_features = teacher_features.detach()
+    student_gradients: Optional[torch.Tensor] = None
+    teacher_gradients: Optional[torch.Tensor] = None
+    if needs_gradients:
+        # the graph of the gradients is only needed to train the student
+        student_gradients = random_scalar_gradients(
+            student_features,
+            [s.positions for s in views.student],
+            probes,
+            create_graph=student.training,
+        )
+        # back to the teacher frame: x' = x R^T  =>  dL/dx = dL/dx' R
+        student_gradients = torch.einsum(
+            "pni,nij->pnj", student_gradients, views.rotations
+        )
+        teacher_features = (
+            teacher(views.teacher, FEATURE_OUTPUT)["feature"].block().values
+        )
+        teacher_gradients = random_scalar_gradients(
+            teacher_features,
+            [s.positions for s in views.teacher],
+            probes,
+            create_graph=False,
+        )
+    else:
+        with torch.no_grad():
+            teacher_features = (
+                teacher(views.teacher, FEATURE_OUTPUT)["feature"].block().values
+            )
 
     types = torch.cat([s.types for s in systems])
     with torch.set_grad_enabled(student.training):
@@ -369,67 +408,72 @@ def grad_jepa_loss(
             views.vectors,
         )
 
-    context = ~views.masked
-    masked_structures = views.in_masked_structure
-    loss_latent_masked = latent_loss(
-        prediction["latent"],
-        teacher_features,
-        views.latent_targets & masked_structures,
+    return StepData(
+        views=views,
+        probes=probes,
+        student_features=student_features,
+        teacher_features=teacher_features.detach(),
+        student_gradients=student_gradients,
+        teacher_gradients=teacher_gradients,
+        prediction=prediction,
+        hypers=hypers,
     )
-    loss_latent_unmasked = latent_loss(
-        prediction["latent"],
-        teacher_features,
-        views.latent_targets & ~masked_structures,
-    )
-    loss_gradient_masked = normalized_gradient_loss(
-        prediction["gradient"],
-        teacher_gradients,
-        views.gradient_targets & masked_structures,
-    )
-    loss_gradient_unmasked = normalized_gradient_loss(
-        prediction["gradient"],
-        teacher_gradients,
-        views.gradient_targets & ~masked_structures,
-    )
-    variance, covariance = vicreg_terms(student_features[context])
-    spread_atoms = context & views.gradient_targets
-    if int(spread_atoms.sum()) >= 2:
-        gradient_spread = relative_gradient_spread(
-            student_features, student_gradients, probes, spread_atoms
-        )
-    else:
-        gradient_spread = student_gradients.sum() * 0.0 + hypers["gradient_std_floor"]
-    loss_gradient_variance = torch.relu(hypers["gradient_std_floor"] - gradient_spread)
 
-    unmasked_scale = weights["unmasked_scale"]
-    loss = (
-        weights["latent"] * (loss_latent_masked + unmasked_scale * loss_latent_unmasked)
-        + weights["gradient"]
-        * (loss_gradient_masked + unmasked_scale * loss_gradient_unmasked)
-        + weights["variance"] * variance
-        + weights["covariance"] * covariance
-        + weights["gradient_variance"] * loss_gradient_variance
+
+def grad_jepa_loss(
+    student: torch.nn.Module,
+    teacher: torch.nn.Module,
+    predictor: torch.nn.Module,
+    terms: Sequence["Term"],
+    systems: List[System],
+    options: NeighborListOptions,
+    hypers: Dict[str, Any],
+    generator: torch.Generator,
+    with_rank: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Compute the Grad-JEPA loss of one batch: the sum of the active terms.
+
+    The probe gradients are computed only if some term needs them.
+
+    :param student: Student PET core (in training mode).
+    :param teacher: EMA teacher PET core (in eval mode, no parameter gradients).
+    :param predictor: The :class:`GradJEPAPredictor`.
+    :param terms: The active loss terms (see :func:`terms.build_terms`).
+    :param systems: Clean systems with the (skin) neighbor list.
+    :param options: PET neighbor list options.
+    :param hypers: The trainer hypers.
+    :param generator: CPU random generator.
+    :param with_rank: Also report the RankMe of (at most 4096) student features.
+    :return: The loss and a dictionary of scalar diagnostics.
+    """
+    if len(terms) == 0:
+        raise ValueError("the objective needs at least one loss term")
+    step = build_step_data(
+        student,
+        teacher,
+        predictor,
+        systems,
+        options,
+        hypers,
+        generator,
+        needs_gradients=any(term.needs_gradients for term in terms),
     )
-    if bool(views.gradient_targets.any()):
-        cosine = torch.nn.functional.cosine_similarity(
-            prediction["gradient"][:, views.gradient_targets].reshape(-1, 3),
-            teacher_gradients[:, views.gradient_targets].reshape(-1, 3),
-            dim=-1,
-        ).mean()
-    else:
-        cosine = torch.zeros(())
-    metrics = {
-        "latent_masked": loss_latent_masked,
-        "latent_unmasked": loss_latent_unmasked,
-        "gradient_masked": loss_gradient_masked,
-        "gradient_unmasked": loss_gradient_unmasked,
-        "variance": variance,
-        "covariance": covariance,
-        "gradient_spread": gradient_spread,
-        "gradient_cosine": cosine,
-        "teacher_gradient_rms": teacher_gradients.pow(2).sum(-1).mean().sqrt(),
-        "masked_fraction": views.masked.double().mean(),
-    }
+
+    losses = []
+    metrics: Dict[str, torch.Tensor] = {}
+    for term in terms:
+        term_loss, diagnostics = term(step)
+        losses.append(term_loss)
+        for name, value in diagnostics.items():
+            if name in metrics:
+                raise ValueError(f"diagnostic '{name}' is reported by two terms")
+            metrics[name] = value
+    loss = losses[0]
+    for term_loss in losses[1:]:
+        loss = loss + term_loss
+
+    context = ~step.views.masked
+    metrics["masked_fraction"] = step.views.masked.double().mean()
     if with_rank:
-        metrics["rankme"] = rankme(student_features[context][:4096])
+        metrics["rankme"] = rankme(step.student_features[context][:4096])
     return loss, {name: float(value.detach()) for name, value in metrics.items()}

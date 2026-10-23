@@ -16,6 +16,7 @@ from metatrain.experimental.grad_jepa.objective import (
     vicreg_terms,
 )
 from metatrain.experimental.grad_jepa.predictor import GradJEPAPredictor
+from metatrain.experimental.grad_jepa.terms import build_terms
 from metatrain.experimental.grad_jepa.views import (
     build_view,
     get_skin_neighbor_list_transform,
@@ -41,6 +42,10 @@ def _setup(frames, dtype=torch.float32, species_query=False):
     # deep copy: ``init_with_defaults`` shares the mutable defaults
     hypers = copy.deepcopy(init_with_defaults(TrainerHypers))
     return student, teacher, predictor, systems, options, hypers
+
+
+def _terms(hypers):
+    return build_terms(hypers["objective"]["terms"])
 
 
 def test_feature_dim_formula():
@@ -82,7 +87,14 @@ def test_loss_backward_reaches_student_and_predictor_only():
     )
     hypers["mask"]["probability"] = 1.0
     loss, metrics = grad_jepa_loss(
-        student, teacher, predictor, systems, options, hypers, torch.Generator()
+        student,
+        teacher,
+        predictor,
+        _terms(hypers),
+        systems,
+        options,
+        hypers,
+        torch.Generator(),
     )
     loss.backward()
     assert torch.isfinite(loss)
@@ -101,6 +113,7 @@ def test_loss_is_deterministic_given_generator():
             student,
             teacher,
             predictor,
+            _terms(hypers),
             systems,
             options,
             hypers,
@@ -153,6 +166,7 @@ def test_degenerate_batches_are_finite(generator, species_query):
                     student,
                     teacher,
                     predictor,
+                    _terms(hypers),
                     systems,
                     options,
                     hypers,
@@ -224,7 +238,14 @@ def test_all_masked_by_default_has_no_unmasked_terms():
         ase.io.read(QM9_PATH, ":6")
     )
     _, metrics = grad_jepa_loss(
-        student, teacher, predictor, systems, options, hypers, torch.Generator()
+        student,
+        teacher,
+        predictor,
+        _terms(hypers),
+        systems,
+        options,
+        hypers,
+        torch.Generator(),
     )
     assert metrics["latent_unmasked"] == 0.0
     assert metrics["gradient_unmasked"] == 0.0

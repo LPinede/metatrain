@@ -35,9 +35,10 @@ The training datasets must not define targets (use ``targets: {}``).
 {{SECTION_MODEL_HYPERS}}
 """
 
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
-from typing_extensions import TypedDict
+from pydantic import AfterValidator
+from typing_extensions import NotRequired, TypedDict
 
 from metatrain.pet.documentation import ModelHypers  # noqa: F401
 from metatrain.utils.hypers import init_with_defaults
@@ -62,7 +63,7 @@ class MaskHypers(TypedDict):
     probability: float = 1.0
     """Probability that a structure is masked in the student view. As in
     Atom-JEPA, every structure is masked by default; unmasked structures only add
-    rotation/displacement consistency terms (see ``loss_weights.unmasked_scale``)."""
+    rotation/displacement consistency terms (see ``objective.unmasked_scale``)."""
     generator: Literal["nl_ball", "k_hop_ego"] = "nl_ball"
     """How the region is sampled: ``nl_ball`` (union of balls around random
     centers, until ``fraction_range`` is reached) or ``k_hop_ego`` (k-hop ego
@@ -84,26 +85,90 @@ class MaskHypers(TypedDict):
     """Structures with fewer atoms are never masked."""
 
 
-class LossWeights(TypedDict):
-    """Weights of the terms of the loss."""
+class LatentTermHypers(TypedDict):
+    """``latent`` term: ``weight * (L_lat^m + unmasked_scale * L_lat^u)``."""
 
-    latent: float = 1.0
-    """Latent prediction (layer-normalized teacher features at target atoms)."""
-    gradient: float = 1.0
-    """Gradient prediction (teacher random-scalar gradients at target and
-    boundary atoms), normalized by the teacher gradient scale."""
+    weight: float = 1.0
+    """Weight of the latent prediction (layer-normalized teacher features at the
+    target atoms)."""
+
+
+class GradientTermHypers(TypedDict):
+    """``gradient`` term: ``weight * (L_grad^m + unmasked_scale * L_grad^u)``."""
+
+    weight: float = 1.0
+    """Weight of the gradient prediction (teacher random-scalar gradients at the
+    target and boundary atoms), normalized by the teacher gradient scale."""
+
+
+class VICRegTermHypers(TypedDict):
+    """``vicreg`` term: ``variance * L_var + covariance * L_cov``."""
+
+    variance: float = 1.0
+    """Weight of the VICReg variance hinge on the layer-normalized student
+    features."""
+    covariance: float = 0.04
+    """Weight of the VICReg covariance penalty on the correlation matrix of the
+    student features (scale-free)."""
+
+
+class GradientSpreadTermHypers(TypedDict):
+    """``gradient_spread`` term: ``weight * relu(floor - spread)``.
+
+    It keeps the spread of the student gradients, relative to the spread of the
+    per-atom random scalars ``v . h_i``, above ``floor`` (prevents the
+    representation becoming flat in the positions)."""
+
+    weight: float = 0.1
+    """Weight of the hinge."""
+    floor: float = 0.01
+    """Floor of the relative gradient spread, in inverse length units
+    (scale-free)."""
+
+
+class TermsHypers(TypedDict):
+    """The loss terms, by name. A term that is absent or ``null`` is disabled.
+
+    ``mtt train`` merges the options with the defaults, so a default term left out
+    of the options file stays enabled: set it to ``null`` to disable it. The
+    latent-only baseline (no probe gradients are computed) is
+    ``{latent: {weight: 1.0}, vicreg: {variance: 1.0, covariance: 0.04},
+    gradient: null, gradient_spread: null}``."""
+
+    latent: NotRequired[Optional[LatentTermHypers]] = init_with_defaults(
+        LatentTermHypers
+    )
+    """Latent prediction."""
+    gradient: NotRequired[Optional[GradientTermHypers]] = init_with_defaults(
+        GradientTermHypers
+    )
+    """Gradient prediction (needs the probe gradients)."""
+    vicreg: NotRequired[Optional[VICRegTermHypers]] = init_with_defaults(
+        VICRegTermHypers
+    )
+    """VICReg variance and covariance regularization."""
+    gradient_spread: NotRequired[Optional[GradientSpreadTermHypers]] = (
+        init_with_defaults(GradientSpreadTermHypers)
+    )
+    """Gradient-spread hinge (needs the probe gradients)."""
+
+
+def _at_least_one_term(terms: dict) -> dict:
+    if all(value is None for value in terms.values()):
+        raise ValueError("`objective.terms` must enable at least one loss term")
+    return terms
+
+
+class ObjectiveHypers(TypedDict):
+    """The loss: a sum of named terms."""
+
     unmasked_scale: float = 0.25
     """Relative weight of the latent and gradient terms of unmasked structures
     (each term is averaged over its own targets, masked and unmasked separately)."""
-    variance: float = 1.0
-    """VICReg variance hinge on the layer-normalized student features."""
-    covariance: float = 0.04
-    """VICReg covariance penalty on the correlation matrix of the student
-    features (scale-free)."""
-    gradient_variance: float = 0.1
-    """Hinge keeping the relative spread of the student gradients above
-    ``gradient_std_floor`` (prevents the representation becoming flat in the
-    positions)."""
+    terms: Annotated[TermsHypers, AfterValidator(_at_least_one_term)] = (
+        init_with_defaults(TermsHypers)
+    )
+    """The active loss terms and their hypers."""
 
 
 class PredictorHypers(TypedDict):
@@ -166,15 +231,11 @@ class TrainerHypers(TypedDict):
     teacher view."""
     num_probes: int = 2
     """Number of random probe vectors per step."""
-    gradient_std_floor: float = 0.01
-    """Floor (in inverse length units) of the student gradient spread divided by
-    the spread of the per-atom random scalars ``v . h_i`` (scale-free, see
-    ``loss_weights.gradient_variance``)."""
     noise: NoiseHypers = init_with_defaults(NoiseHypers)
     """Displacements of the teacher view."""
     mask: MaskHypers = init_with_defaults(MaskHypers)
     """Masking of the student view."""
     predictor: PredictorHypers = init_with_defaults(PredictorHypers)
     """Predictor hyperparameters."""
-    loss_weights: LossWeights = init_with_defaults(LossWeights)
-    """Weights of the loss terms."""
+    objective: ObjectiveHypers = init_with_defaults(ObjectiveHypers)
+    """The loss terms and their weights."""

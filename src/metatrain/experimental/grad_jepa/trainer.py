@@ -31,6 +31,7 @@ from metatrain.utils.wrapper import MetatrainModel
 
 from .objective import grad_jepa_loss
 from .predictor import GradJEPAPredictor
+from .terms import build_terms
 from .views import get_skin_neighbor_list_transform
 
 
@@ -110,6 +111,7 @@ class Trainer(TrainerInterface):
         model.to(device=device, dtype=dtype)
         options = student.requested_neighbor_lists()[0]
         check_hypers(hypers, options.cutoff)
+        terms = build_terms(hypers["objective"]["terms"])
         feature_dim = student.num_readout_layers * (student.d_node + student.d_pet)
         predictor = GradJEPAPredictor(
             feature_dim=feature_dim,
@@ -193,7 +195,14 @@ class Trainer(TrainerInterface):
                 systems, _, _ = unpack_batch(batch)
                 systems, _, _ = batch_to(systems, {}, {}, dtype=dtype, device=device)
                 loss, metrics = grad_jepa_loss(
-                    student, teacher, predictor, systems, options, hypers, generator
+                    student,
+                    teacher,
+                    predictor,
+                    terms,
+                    systems,
+                    options,
+                    hypers,
+                    generator,
                 )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, hypers["grad_clip_norm"])
@@ -218,6 +227,7 @@ class Trainer(TrainerInterface):
                     student,
                     teacher,
                     predictor,
+                    terms,
                     systems,
                     options,
                     hypers,
