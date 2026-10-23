@@ -1,0 +1,435 @@
+"""The Grad-JEPA objective: view construction, random-scalar gradients and losses."""
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
+
+import torch
+from metatomic.torch import ModelOutput, NeighborListOptions, System
+
+from .masking import boundary_atoms, k_hop_ego_region, nl_ball_region
+from .views import bounded_noise, build_view, pair_vectors, random_rotations
+
+
+FEATURE_OUTPUT = {"feature": ModelOutput(sample_kind="atom")}
+
+
+@dataclass
+class Views:
+    """Student/teacher views of a batch and the per-atom bookkeeping."""
+
+    student: List[System]
+    teacher: List[System]
+    rotations: torch.Tensor  # (n_atoms, 3, 3), rotation of each atom's system
+    displacements: torch.Tensor  # (n_atoms, 3), teacher-view displacements
+    masked: torch.Tensor  # (n_atoms,) bool
+    in_masked_structure: torch.Tensor  # (n_atoms,) bool, atom's structure is masked
+    latent_targets: torch.Tensor  # (n_atoms,) bool
+    gradient_targets: torch.Tensor  # (n_atoms,) bool
+    pairs: torch.Tensor  # (n_pairs, 2) clean pairs below the cutoff, batch-global
+    vectors: torch.Tensor  # (n_pairs, 3) clean pair vectors, teacher frame
+
+
+def build_views(
+    systems: List[System],
+    options: NeighborListOptions,
+    hypers: Dict[str, Any],
+    generator: torch.Generator,
+) -> Views:
+    """Sample a rotation, a displacement field and a mask for every system.
+
+    The teacher sees the full structure, displaced by ``delta`` (with probability
+    ``noise.probability``), in the original frame. The student sees the clean
+    structure, rotated, with all pairs touching masked atoms removed (with
+    probability ``mask.probability``).
+
+    :param systems: Clean systems holding a (skin) neighbor list for ``options``.
+    :param options: PET neighbor list options.
+    :param hypers: The trainer hypers.
+    :param generator: CPU random generator driving all sampling.
+    :return: The views.
+    """
+    dtype = systems[0].positions.dtype
+    device = systems[0].positions.device
+    cutoff = options.cutoff
+    noise_hypers = hypers["noise"]
+    mask_hypers = hypers["mask"]
+    rotations = random_rotations(
+        len(systems), hypers["rotation_group"], dtype, generator
+    )
+
+    student, teacher = [], []
+    all_rotations, all_displacements, all_masked, all_in_masked = [], [], [], []
+    all_latent, all_gradient, all_pairs, all_vectors = [], [], [], []
+    offset = 0
+    for index, system in enumerate(systems):
+        n_atoms = len(system)
+        samples = system.get_neighbor_list(options).samples.values
+        clean_vectors = pair_vectors(system.positions, system.cell, samples)
+        distances = clean_vectors.norm(dim=-1)
+        pairs = samples[:, :2]
+        # region sampling loops over atoms: run it on CPU to avoid device syncs
+        pairs_cpu = pairs.cpu()
+        distances_cpu = distances.detach().cpu()
+
+        # teacher view: full structure, optionally displaced
+        delta = torch.zeros(n_atoms, 3, dtype=dtype)
+        if float(torch.rand(1, generator=generator)) < noise_hypers["probability"]:
+            delta = bounded_noise(
+                n_atoms,
+                noise_hypers["sigma"],
+                noise_hypers["skin"] / 2,
+                dtype,
+                generator,
+            )
+            # remove the global translation (PET is invariant to it, the predictor
+            # sees absolute displacements); relative displacements, and hence the
+            # exactness of the skin neighbor list, are unchanged
+            delta = delta - delta.mean(dim=0)
+        delta = delta.to(device)
+        teacher.append(
+            build_view(
+                system,
+                options,
+                (system.positions + delta).detach().requires_grad_(True),
+                system.cell,
+            )
+        )
+
+        # mask: a region, assigned to the masked role (or to the context role
+        # with probability ``swap_probability``)
+        masked = torch.zeros(n_atoms, dtype=torch.bool)
+        apply_mask = (
+            n_atoms >= mask_hypers["min_atoms"]
+            and float(torch.rand(1, generator=generator)) < mask_hypers["probability"]
+        )
+        if apply_mask:
+            if mask_hypers["generator"] == "nl_ball":
+                low, high = mask_hypers["fraction_range"]
+                fraction = low + (high - low) * float(
+                    torch.rand(1, generator=generator)
+                )
+                region = nl_ball_region(
+                    n_atoms,
+                    pairs_cpu,
+                    distances_cpu,
+                    mask_hypers["ball_radius_range"],
+                    fraction,
+                    generator,
+                )
+            elif mask_hypers["generator"] == "k_hop_ego":
+                region = k_hop_ego_region(
+                    n_atoms,
+                    pairs_cpu,
+                    distances_cpu,
+                    mask_hypers["ego_hops"],
+                    mask_hypers["topology_cutoff"],
+                    generator,
+                )
+            else:
+                raise ValueError(f"unknown mask generator '{mask_hypers['generator']}'")
+            swap = (
+                float(torch.rand(1, generator=generator))
+                < mask_hypers["swap_probability"]
+            )
+            masked = ~region if swap else region
+            if bool(masked.all()) or not bool(masked.any()):
+                masked = torch.zeros_like(masked)  # degenerate region: no mask
+        masked = masked.to(device)
+
+        # student view: clean, rotated, masked pairs removed
+        rotation = rotations[index].to(device)
+        keep = ~(masked[samples[:, 0]] | masked[samples[:, 1]])
+        student.append(
+            build_view(
+                system,
+                options,
+                (system.positions @ rotation.T).detach().requires_grad_(True),
+                system.cell @ rotation.T,
+                keep_pairs=keep,
+            )
+        )
+
+        close = distances < cutoff
+        # atoms without neighbors have an identically zero teacher gradient
+        has_neighbors = torch.zeros_like(masked)
+        has_neighbors[pairs[close, 0]] = True
+        if bool(masked.any()):
+            # masked atoms are only predictable from context neighbors (the
+            # predictor does one round of message passing within the cutoff)
+            reachable = torch.zeros_like(masked)
+            reachable[pairs[close & ~masked[pairs[:, 1]], 0]] = True
+            latent_targets = masked & reachable
+            gradient_targets = (masked & reachable) | boundary_atoms(
+                masked, pairs, distances, cutoff
+            )
+        else:
+            latent_targets = torch.ones_like(masked)
+            gradient_targets = torch.ones_like(masked)
+        gradient_targets = gradient_targets & has_neighbors
+        all_rotations.append(rotation.expand(n_atoms, 3, 3))
+        all_displacements.append(delta)
+        all_masked.append(masked)
+        all_in_masked.append(masked.any().expand(n_atoms))
+        all_latent.append(latent_targets)
+        all_gradient.append(gradient_targets)
+        all_pairs.append(pairs[close] + offset)
+        all_vectors.append(clean_vectors[close])
+        offset += n_atoms
+
+    return Views(
+        student=student,
+        teacher=teacher,
+        rotations=torch.cat(all_rotations),
+        displacements=torch.cat(all_displacements),
+        masked=torch.cat(all_masked),
+        in_masked_structure=torch.cat(all_in_masked),
+        latent_targets=torch.cat(all_latent),
+        gradient_targets=torch.cat(all_gradient),
+        pairs=torch.cat(all_pairs),
+        vectors=torch.cat(all_vectors),
+    )
+
+
+def sample_probes(
+    num_probes: int, dim: int, dtype: torch.dtype, generator: torch.Generator
+) -> torch.Tensor:
+    """Rademacher probes scaled by ``1/sqrt(dim)``, shape ``(num_probes, dim)``."""
+    signs = torch.randint(0, 2, (num_probes, dim), generator=generator) * 2 - 1
+    return signs.to(dtype) / dim**0.5
+
+
+def random_scalar_gradients(
+    features: torch.Tensor,
+    positions: List[torch.Tensor],
+    probes: torch.Tensor,
+    create_graph: bool,
+) -> torch.Tensor:
+    """Gradients of the random scalars ``s_p = sum_i v_p . h_i`` w.r.t. positions.
+
+    :param features: Per-atom features ``(n_atoms, D)``.
+    :param positions: Position tensors of every system (requiring grad).
+    :param probes: Probe vectors ``(n_probes, D)``.
+    :param create_graph: Whether to build the graph of the gradient (student).
+    :return: Gradients ``(n_probes, n_atoms, 3)``.
+    """
+    scalars = (features @ probes.T).sum(dim=0)  # (n_probes,)
+    gradients = []
+    for p in range(probes.shape[0]):
+        grads = torch.autograd.grad(
+            scalars[p],
+            positions,
+            create_graph=create_graph,
+            retain_graph=create_graph or p < probes.shape[0] - 1,
+        )
+        gradients.append(torch.cat(grads))
+    return torch.stack(gradients)
+
+
+def normalized_gradient_loss(
+    prediction: torch.Tensor, target: torch.Tensor, select: torch.Tensor
+) -> torch.Tensor:
+    """Per-probe MSE normalized by the mean squared norm of the target.
+
+    :param prediction: ``(n_probes, n_atoms, 3)``.
+    :param target: ``(n_probes, n_atoms, 3)``.
+    :param select: Boolean atom mask of the targets.
+    :return: Scalar loss.
+    """
+    if not bool(select.any()):
+        return prediction.sum() * 0.0
+    error = ((prediction - target)[:, select] ** 2).sum(-1).mean(-1)
+    scale = (target[:, select] ** 2).sum(-1).mean(-1).detach() + 1e-8
+    return (error / scale).mean()
+
+
+def latent_loss(
+    prediction: torch.Tensor, target: torch.Tensor, select: torch.Tensor
+) -> torch.Tensor:
+    """MSE to layer-normalized (no affine) teacher features on selected atoms."""
+    if not bool(select.any()):
+        return prediction.sum() * 0.0
+    target = torch.nn.functional.layer_norm(target, target.shape[-1:])
+    return ((prediction[select] - target[select]) ** 2).mean()
+
+
+def vicreg_terms(features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Scale-free VICReg terms over rows (atoms).
+
+    The variance hinge (at 1) acts on the per-dimension spread of the
+    layer-normalized features, and the covariance penalty on the off-diagonal of
+    their correlation matrix, so neither depends on the raw feature scale.
+
+    :param features: Features ``(n_rows, D)``.
+    :return: The variance and covariance terms.
+    """
+    if features.shape[0] < 2:
+        zero = features.sum() * 0.0
+        return zero, zero
+    normalized = torch.nn.functional.layer_norm(features, features.shape[-1:])
+    centered = normalized - normalized.mean(dim=0)
+    std = torch.sqrt(centered.var(dim=0) + 1e-4)
+    variance = torch.relu(1.0 - std).mean()
+    n, d = centered.shape
+    standardized = centered / std
+    correlation = standardized.T @ standardized / (n - 1)
+    off_diagonal = correlation - torch.diag(torch.diagonal(correlation))
+    return variance, (off_diagonal**2).sum() / d
+
+
+def relative_gradient_spread(
+    features: torch.Tensor,
+    gradients: torch.Tensor,
+    probes: torch.Tensor,
+    select: torch.Tensor,
+) -> torch.Tensor:
+    """Spread of the gradients relative to the spread of the per-atom scalars.
+
+    ``mean_p std_i(g_pi) / std_i(v_p . h_i)``, in inverse length units, which is
+    invariant to the scale of the features.
+
+    :param features: Features ``(n_atoms, D)``.
+    :param gradients: Gradients ``(n_probes, n_atoms, 3)``.
+    :param probes: Probes ``(n_probes, D)``.
+    :param select: Boolean mask of the atoms to use (at least 2).
+    :return: Scalar spread.
+    """
+    scalars = (features[select] @ probes.T).T  # (n_probes, n_selected)
+    spread = gradients[:, select].std(dim=1).mean(dim=-1)  # (n_probes,)
+    return (spread / (scalars.std(dim=1) + 1e-8)).mean()
+
+
+def rankme(features: torch.Tensor) -> torch.Tensor:
+    """RankMe effective rank (exp of the spectral entropy) of the rows."""
+    singular = torch.linalg.svdvals(features.detach().double())
+    p = singular / (singular.sum() + 1e-12) + 1e-12
+    return torch.exp(-(p * torch.log(p)).sum())
+
+
+def grad_jepa_loss(
+    student: torch.nn.Module,
+    teacher: torch.nn.Module,
+    predictor: torch.nn.Module,
+    systems: List[System],
+    options: NeighborListOptions,
+    hypers: Dict[str, Any],
+    generator: torch.Generator,
+    with_rank: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Compute the full Grad-JEPA loss for one batch.
+
+    :param student: Student PET core (in training mode).
+    :param teacher: EMA teacher PET core (in eval mode, no parameter gradients).
+    :param predictor: The :class:`GradJEPAPredictor`.
+    :param systems: Clean systems with the (skin) neighbor list.
+    :param options: PET neighbor list options.
+    :param hypers: The trainer hypers.
+    :param generator: CPU random generator.
+    :param with_rank: Also report the RankMe of (at most 4096) student features.
+    :return: The loss and a dictionary of scalar diagnostics.
+    """
+    views = build_views(systems, options, hypers, generator)
+    weights = hypers["loss_weights"]
+
+    student_features = student(views.student, FEATURE_OUTPUT)["feature"].block().values
+    probes = sample_probes(
+        hypers["num_probes"],
+        student_features.shape[1],
+        student_features.dtype,
+        generator,
+    ).to(student_features.device)
+    # the graph of the gradients is only needed to train the student
+    student_gradients = random_scalar_gradients(
+        student_features,
+        [s.positions for s in views.student],
+        probes,
+        create_graph=student.training,
+    )
+    # back to the teacher frame: x' = x R^T  =>  dL/dx = dL/dx' R
+    student_gradients = torch.einsum("pni,nij->pnj", student_gradients, views.rotations)
+
+    teacher_features = teacher(views.teacher, FEATURE_OUTPUT)["feature"].block().values
+    teacher_gradients = random_scalar_gradients(
+        teacher_features,
+        [s.positions for s in views.teacher],
+        probes,
+        create_graph=False,
+    )
+    teacher_features = teacher_features.detach()
+
+    types = torch.cat([s.types for s in systems])
+    with torch.set_grad_enabled(student.training):
+        prediction = predictor(
+            student_features,
+            student_gradients,
+            probes,
+            views.displacements,
+            types,
+            views.masked,
+            views.pairs,
+            views.vectors,
+        )
+
+    context = ~views.masked
+    masked_structures = views.in_masked_structure
+    loss_latent_masked = latent_loss(
+        prediction["latent"],
+        teacher_features,
+        views.latent_targets & masked_structures,
+    )
+    loss_latent_unmasked = latent_loss(
+        prediction["latent"],
+        teacher_features,
+        views.latent_targets & ~masked_structures,
+    )
+    loss_gradient_masked = normalized_gradient_loss(
+        prediction["gradient"],
+        teacher_gradients,
+        views.gradient_targets & masked_structures,
+    )
+    loss_gradient_unmasked = normalized_gradient_loss(
+        prediction["gradient"],
+        teacher_gradients,
+        views.gradient_targets & ~masked_structures,
+    )
+    variance, covariance = vicreg_terms(student_features[context])
+    spread_atoms = context & views.gradient_targets
+    if int(spread_atoms.sum()) >= 2:
+        gradient_spread = relative_gradient_spread(
+            student_features, student_gradients, probes, spread_atoms
+        )
+    else:
+        gradient_spread = student_gradients.sum() * 0.0 + hypers["gradient_std_floor"]
+    loss_gradient_variance = torch.relu(hypers["gradient_std_floor"] - gradient_spread)
+
+    unmasked_scale = weights["unmasked_scale"]
+    loss = (
+        weights["latent"] * (loss_latent_masked + unmasked_scale * loss_latent_unmasked)
+        + weights["gradient"]
+        * (loss_gradient_masked + unmasked_scale * loss_gradient_unmasked)
+        + weights["variance"] * variance
+        + weights["covariance"] * covariance
+        + weights["gradient_variance"] * loss_gradient_variance
+    )
+    if bool(views.gradient_targets.any()):
+        cosine = torch.nn.functional.cosine_similarity(
+            prediction["gradient"][:, views.gradient_targets].reshape(-1, 3),
+            teacher_gradients[:, views.gradient_targets].reshape(-1, 3),
+            dim=-1,
+        ).mean()
+    else:
+        cosine = torch.zeros(())
+    metrics = {
+        "latent_masked": loss_latent_masked,
+        "latent_unmasked": loss_latent_unmasked,
+        "gradient_masked": loss_gradient_masked,
+        "gradient_unmasked": loss_gradient_unmasked,
+        "variance": variance,
+        "covariance": covariance,
+        "gradient_spread": gradient_spread,
+        "gradient_cosine": cosine,
+        "teacher_gradient_rms": teacher_gradients.pow(2).sum(-1).mean().sqrt(),
+        "masked_fraction": views.masked.double().mean(),
+    }
+    if with_rank:
+        metrics["rankme"] = rankme(student_features[context][:4096])
+    return loss, {name: float(value.detach()) for name, value in metrics.items()}
