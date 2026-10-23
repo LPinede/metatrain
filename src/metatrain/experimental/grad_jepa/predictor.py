@@ -7,7 +7,7 @@ rotation-covariant by construction even though PET is not. It is also linear in
 the probe vector ``v``, so that matching random slices matches the Jacobian.
 """
 
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -79,7 +79,7 @@ class GradJEPAPredictor(torch.nn.Module):
     def forward(
         self,
         features: torch.Tensor,
-        gradients: torch.Tensor,
+        gradients: Optional[torch.Tensor],
         probes: torch.Tensor,
         displacements: torch.Tensor,
         types: torch.Tensor,
@@ -91,7 +91,8 @@ class GradJEPAPredictor(torch.nn.Module):
         :param features: Student features ``(n_atoms, D)`` (rows of masked atoms
             are ignored).
         :param gradients: Student gradients in the teacher frame
-            ``(n_probes, n_atoms, 3)`` (zero at masked atoms).
+            ``(n_probes, n_atoms, 3)`` (zero at masked atoms), or ``None`` to
+            predict only the latents.
         :param probes: Probe vectors ``(n_probes, D)``.
         :param displacements: Teacher-view displacements ``(n_atoms, 3)``.
         :param types: Atomic types ``(n_atoms,)``.
@@ -100,7 +101,8 @@ class GradJEPAPredictor(torch.nn.Module):
             batch-global indices, restricted to distances below the cutoff.
         :param vectors: Pair vectors ``(n_pairs, 3)`` in the teacher frame.
         :return: ``{"latent": (n_atoms, D), "gradient": (n_probes, n_atoms, 3)}``,
-            defined for every atom (callers select the target atoms).
+            defined for every atom (callers select the target atoms); only
+            ``latent`` when ``gradients`` is ``None``.
         """
         n_atoms = features.shape[0]
         context = ~masked
@@ -144,6 +146,8 @@ class GradJEPAPredictor(torch.nn.Module):
 
         aggregated = torch.zeros_like(query).index_add(0, centers, messages) / norm
         latent = self.latent_head(torch.cat([query, aggregated], dim=-1))
+        if gradients is None:
+            return {"latent": latent}
 
         # gradient prediction, linear in the probes
         projected = self.probe_projection(probes)  # (n_probes, probe_dim)
