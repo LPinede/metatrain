@@ -61,9 +61,17 @@ def test_shapes(inputs):
     assert out["gradient"].shape == (2, N, 3)
 
 
-def test_rotation_covariance(inputs):
+@pytest.mark.parametrize("improper", [False, True])
+def test_rotation_covariance(inputs, improper):
     predictor = _predictor()
-    rotation = random_rotations(1, "O3", torch.float64, torch.Generator())[0]
+    generator = torch.Generator().manual_seed(0)
+    rotation = random_rotations(1, "SO3", torch.float64, generator)[0]
+    if improper:
+        # inversion composed with a rotation: det = -1
+        rotation = -rotation
+        assert torch.det(rotation) < 0
+    else:
+        assert torch.det(rotation) > 0
     rotated = dict(inputs)
     for key in ["gradients", "displacements", "vectors"]:
         rotated[key] = inputs[key] @ rotation.T
