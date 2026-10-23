@@ -50,14 +50,20 @@ def test_bounded_noise_norm():
     assert delta.norm(dim=1).max() <= 0.25 + 1e-12
 
 
-def test_rotation_gradient_mapping():
+@pytest.mark.parametrize("proper", [True, False])
+def test_rotation_gradient_mapping(proper):
     """For an O(3)-invariant function of the pairs, the gradient w.r.t. the rotated
-    positions, mapped back with ``g' R``, equals the gradient in the original frame."""
+    positions, mapped back with ``g' R``, equals the gradient in the original frame,
+    for proper (``R``) and improper (``-R``) rotations."""
     options = NeighborListOptions(cutoff=4.0, full_list=True, strict=False)
     frame = ase.io.read(CARBON_PATH, 0)
     (system,) = to_systems([frame], torch.float64)
     system = get_system_with_neighbor_lists(system, [options])
-    rotation = random_rotations(1, "O3", torch.float64, torch.Generator())[0]
+    generator = torch.Generator().manual_seed(0)
+    rotation = random_rotations(1, "SO3", torch.float64, generator)[0]
+    if not proper:
+        rotation = -rotation
+    assert (torch.linalg.det(rotation) > 0) == proper
 
     def energy(view: System) -> torch.Tensor:
         return view.get_neighbor_list(options).values.norm(dim=1).pow(3).sum()
