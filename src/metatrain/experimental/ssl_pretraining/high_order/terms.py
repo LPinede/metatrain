@@ -30,6 +30,11 @@ MIN_CHIRALITY_NEIGHBORS = 3
 FLOOR_LEVEL = 0.1
 """Level of the per-batch variance floor, in target standard deviations."""
 
+MIN_TARGET_VARIANCE = 1e-8
+"""Batch variance of a block's targets (target units squared) below which the block
+counts as having no targets: it costs nothing and leaves the EMA of its target
+variance untouched (normalizing by a vanishing variance would blow up the loss)."""
+
 
 def _block_loss(
     norm: BlockNormalizer,
@@ -38,8 +43,14 @@ def _block_loss(
     target: torch.Tensor,
     diag: Dict[str, torch.Tensor],
 ) -> torch.Tensor:
-    """Normalized MSE of one block (zero, but in the graph, without targets)."""
-    if target.numel() == 0:
+    """Normalized MSE of one block; zero, but in the graph, for a block with fewer
+    than two sites or without target variance (reported as ``{name}/skipped``)."""
+    skipped = (
+        target.shape[0] < 2
+        or float(target.detach().var(unbiased=False)) < MIN_TARGET_VARIANCE
+    )
+    diag[f"{name}/skipped"] = pred.new_tensor(float(skipped)).detach()
+    if skipped:
         return pred.sum() * 0.0
     loss = norm(name, pred, target)
     with torch.no_grad():

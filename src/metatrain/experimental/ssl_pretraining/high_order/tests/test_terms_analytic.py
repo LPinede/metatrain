@@ -355,3 +355,53 @@ def test_high_order_term_contract(name):
             assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
             assert any(p.grad is not None for p in student.parameters())
             assert all(p.grad is None for p in teacher.parameters())
+
+
+@pytest.fixture
+def achiral_step_data(pet_core, small_teacher):
+    """Two dimers and a planar formic acid: kappa is identically zero."""
+    frames = [
+        ase.Atoms("H2", positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.74]]),
+        ase.Atoms("CO", positions=[[0.0, 0.0, 0.0], [1.13, 0.0, 0.0]]),
+        ase.Atoms(
+            "HCOOH",
+            positions=[
+                [-0.95, 0.55, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, -1.2, 0.0],
+                [1.15, 0.7, 0.0],
+                [1.9, 0.1, 0.0],
+            ],
+        ),
+    ]
+    return make_step(make_batch(frames, torch.float32), pet_core, small_teacher)
+
+
+def test_blocks_without_target_variance_are_skipped(achiral_step_data, step_data):
+    """A zero-variance block costs nothing, reports ``skipped`` and never touches
+    the EMA of its target variance."""
+    term = _chirality(achiral_step_data)
+    target = term.teacher_frame_targets(achiral_step_data)["l0"]
+    assert target.numel() >= 2 and target.abs().max() == 0
+    loss, diag = term(achiral_step_data)
+    assert loss.requires_grad and float(loss.detach()) == 0.0
+    assert float(diag["chirality/l0/skipped"]) == 1.0
+    assert term.norm.var == {}
+
+    # a stored EMA is not updated by a zero-variance batch
+    _, diag = term(step_data)
+    assert float(diag["chirality/l0/skipped"]) == 0.0
+    stored = dict(term.norm.var)
+    term(achiral_step_data)
+    assert term.norm.var == stored
+
+
+def test_isolated_deformed_atom_is_skipped(pet_core, small_teacher):
+    """One deformed atom: every block has a single row, so no batch variance."""
+    batch = make_batch([ase.Atoms("H", positions=[[0.0, 0.0, 0.0]])], torch.float32)
+    step = make_step(batch, pet_core, small_teacher, p_def=1.0)
+    term = _jets(step)
+    loss, diag = term(step)
+    assert float(loss.detach()) == 0.0
+    assert all(float(diag[f"deformation_jets/{b}/skipped"]) == 1.0 for b in term.BLOCKS)
+    assert term.norm.var == {}
