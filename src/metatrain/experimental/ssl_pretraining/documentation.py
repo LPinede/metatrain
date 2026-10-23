@@ -328,6 +328,14 @@ class TrainerHypers(TypedDict):
     """Predictor hyperparameters."""
     objective: ObjectiveHypers = init_with_defaults(ObjectiveHypers)
     """The loss terms and their weights."""
+    freeze_backbone: bool = False
+    """Keep the backbone at its initial weights (head-capacity control of the design
+    pilots: train the predictor and the loss terms on a frozen, randomly initialized
+    backbone). The student backbone gets no gradient and is excluded from the
+    optimizer and from gradient clipping. The EMA update is skipped: the teacher is
+    the copy of the student made at the start, so it stays equal to the student, and
+    the exported model is the frozen backbone. The predictor and the parametric loss
+    terms are still trained."""
     allow_no_anti_collapse: bool = False
     """Whether ``objective.terms`` may hold no anti-collapse term. Exactly one of
     ``vicreg``, ``sigreg`` and ``vicreg_averaged`` must be active otherwise. Set it

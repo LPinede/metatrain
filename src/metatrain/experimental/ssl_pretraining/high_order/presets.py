@@ -1,7 +1,8 @@
 """Named configurations of the high-order SSL method.
 
-A preset is a nested override of the trainer hypers (``views``, ``high_order``,
-``objective.terms`` and ``rotation_group``), applied with :func:`apply_preset`.
+A preset is a nested override of the trainer hypers (``views``, ``high_order`` and
+``objective.terms``; ``rotation_group`` keeps the trainer default), applied with
+:func:`apply_preset`.
 There is no ``preset`` hyperparameter: write the result of :func:`apply_preset` into
 the ``architecture.training`` section of the options file.
 
@@ -25,10 +26,23 @@ method are preset-level helpers that write the ``weight`` of each term:
 
     base = copy.deepcopy(init_with_defaults(TrainerHypers))
     hypers = apply_preset("high_order_sigreg", base)
+
+To use a preset without importing this module, dump it as YAML (the
+``architecture.training`` overrides, every term explicit, ``null`` kept):
+
+.. code-block:: bash
+
+    python -m metatrain.experimental.ssl_pretraining.high_order.presets \\
+        dump high_order_sigreg --base training.yaml -o preset-training.yaml
 """
 
+import argparse
 import copy
-from typing import Any, Dict, Optional
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
 
 from metatrain.utils.hypers import init_with_defaults
 
@@ -96,7 +110,6 @@ def _preset(
         "views": {"builder": "high_order"},
         # no teacher term reads the antithetic teacher pair
         "high_order": {"teacher_pair": False, "second_rotation": second_rotation},
-        "rotation_group": "O3",
         "objective": {"terms": all_terms},
     }
 
@@ -193,3 +206,40 @@ def apply_preset(name: str, base_hypers: Dict[str, Any]) -> Dict[str, Any]:
     objective = hypers.setdefault("objective", {})
     objective["terms"] = copy.deepcopy(preset["objective"]["terms"])
     return hypers
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Command line entry point: ``dump <preset> [--base base.yaml] [-o out.yaml]``.
+
+    Writes the ``architecture.training`` overrides of the preset as YAML, with every
+    term of ``objective.terms`` explicit (``null`` for the disabled ones). ``--base``
+    is a YAML file with a partial ``training`` section that the preset is applied to.
+
+    :param argv: The command line arguments (``sys.argv[1:]`` by default).
+    :return: The exit code.
+    """
+    parser = argparse.ArgumentParser(prog="presets", description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    dump = commands.add_parser("dump", help="write a preset as YAML")
+    dump.add_argument("preset", help="preset name: " + ", ".join(sorted(PRESETS)))
+    dump.add_argument("--base", type=Path, help="YAML with a partial training section")
+    dump.add_argument("-o", "--output", type=Path, help="output file (default stdout)")
+    args = parser.parse_args(argv)
+
+    base: Dict[str, Any] = {}
+    if args.base is not None:
+        base = yaml.safe_load(args.base.read_text()) or {}
+    try:
+        hypers = apply_preset(args.preset, base)
+    except (NotImplementedError, ValueError) as error:
+        parser.error(str(error))
+    text = yaml.safe_dump(hypers, sort_keys=False)
+    if args.output is None:
+        sys.stdout.write(text)
+    else:
+        args.output.write_text(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

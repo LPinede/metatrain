@@ -554,3 +554,76 @@ def test_training_without_prediction_terms_builds_no_predictor(tmp_path):
         str(tmp_path),
     )
     assert resumed.epoch == 1
+
+
+def _core_parameters(model) -> dict:
+    return {k: v.detach().clone() for k, v in model.core.named_parameters()}
+
+
+def test_freeze_backbone_trains_only_the_heads(tmp_path, monkeypatch):
+    torch.manual_seed(0)
+    dataset = _dataset()
+    trainer = Trainer(_with_scale_term(monkeypatch, num_epochs=2, freeze_backbone=True))
+    model = trainer.setup(small_model_hypers(), INFO)
+    initial = _core_parameters(model)
+    trainer.train(
+        model, torch.float32, [torch.device("cpu")], [dataset], [dataset], str(tmp_path)
+    )
+    for name, value in model.core.named_parameters():
+        assert not value.requires_grad
+        torch.testing.assert_close(value, initial[name])
+    # the term and the predictor are still trained
+    assert trainer.terms_state_dict["scale.scale"] != 1.0
+    assert trainer.predictor_state_dict is not None
+    # the teacher is not updated and stays equal to the student
+    teacher = trainer.teacher_state_dict
+    for name, value in model.core.state_dict().items():
+        if isinstance(value, torch.Tensor):
+            torch.testing.assert_close(teacher[name], value)
+    # the exported weights are the frozen random backbone
+    for name, value in initial.items():
+        torch.testing.assert_close(trainer.best_model_state_dict[f"core.{name}"], value)
+
+    # checkpoint and restart
+    path = tmp_path / "frozen.ckpt"
+    trainer.save_checkpoint(model, path)
+    resumed = Trainer(
+        _with_scale_term(
+            monkeypatch, num_epochs=3, freeze_backbone=True, restart_from=str(path)
+        )
+    )
+    resumed_model = resumed.setup(small_model_hypers(), INFO)
+    resumed.train(
+        resumed_model,
+        torch.float32,
+        [torch.device("cpu")],
+        [dataset],
+        [dataset],
+        str(tmp_path),
+    )
+    assert resumed.epoch == 2
+    for name, value in resumed_model.core.named_parameters():
+        torch.testing.assert_close(value, initial[name])
+    assert (
+        resumed.terms_state_dict["scale.scale"]
+        != trainer.terms_state_dict["scale.scale"]
+    )
+
+
+def test_freeze_backbone_needs_something_to_train(tmp_path):
+    hypers = _trainer_hypers(freeze_backbone=True)
+    vicreg = hypers["objective"]["terms"]["vicreg"]
+    hypers["objective"]["terms"] = {name: None for name in hypers["objective"]["terms"]}
+    hypers["objective"]["terms"]["vicreg"] = vicreg
+    trainer = Trainer(hypers)
+    model = trainer.setup(small_model_hypers(), INFO)
+    dataset = _dataset()
+    with pytest.raises(ValueError, match="freeze_backbone"):
+        trainer.train(
+            model,
+            torch.float32,
+            [torch.device("cpu")],
+            [dataset],
+            [dataset],
+            str(tmp_path),
+        )

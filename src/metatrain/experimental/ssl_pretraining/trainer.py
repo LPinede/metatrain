@@ -190,10 +190,20 @@ class Trainer(TrainerInterface):
             raise ValueError("ssl_pretraining needs a non-empty validation set")
 
         # student, predictor, terms: the order of the saved optimizer state
-        parameters = list(student.parameters())
+        if hypers["freeze_backbone"]:
+            for parameter in student.parameters():
+                parameter.requires_grad_(False)
+            parameters: List[torch.nn.Parameter] = []
+        else:
+            parameters = list(student.parameters())
         if predictor is not None:
             parameters += list(predictor.parameters())
         parameters += list(term_modules.parameters())
+        if len(parameters) == 0:
+            raise ValueError(
+                "`freeze_backbone: true` needs a predictor or a term with parameters "
+                "to train"
+            )
         optimizer = torch.optim.AdamW(
             parameters, lr=hypers["learning_rate"], weight_decay=hypers["weight_decay"]
         )
@@ -243,7 +253,9 @@ class Trainer(TrainerInterface):
                 tau = tau_start + (tau_end - tau_start) * min(
                     1.0, self.step / max(1, total_steps)
                 )
-                ema_update(teacher, student, tau)
+                if not hypers["freeze_backbone"]:
+                    # a frozen backbone: the teacher stays equal to the student
+                    ema_update(teacher, student, tau)
                 self.step += 1
                 _accumulate(train_metrics, {"loss": float(loss.detach()), **metrics})
                 n_train += 1
@@ -525,13 +537,14 @@ def check_term_combination(hypers: Dict[str, Any]) -> None:
             f"{', '.join(ANTI_COLLAPSE_TERMS)} (got {len(anti_collapse)}); "
             "`allow_no_anti_collapse: true` allows none (design pilots only)"
         )
-    if "equivariant_vicreg" in terms:
-        group = terms["equivariant_vicreg"]["rotation_group"]
-        if hypers["rotation_group"] == "none":
+    for name in SECOND_ROTATION_TERMS:
+        if name in terms and hypers["rotation_group"] == "none":
             raise ValueError(
-                "the 'equivariant_vicreg' term needs random student rotations "
+                f"the '{name}' term needs random student rotations "
                 "(`rotation_group` is 'none')"
             )
+    if "equivariant_vicreg" in terms:
+        group = terms["equivariant_vicreg"]["rotation_group"]
         if group != hypers["rotation_group"]:
             raise ValueError(
                 f"the 'equivariant_vicreg' term's `rotation_group` ({group}) must "

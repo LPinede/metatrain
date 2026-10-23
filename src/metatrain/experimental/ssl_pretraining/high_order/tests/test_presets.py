@@ -6,6 +6,7 @@ import warnings
 
 import pytest
 import torch
+import yaml
 from omegaconf import OmegaConf
 
 from metatrain.experimental.ssl_pretraining.documentation import (
@@ -275,11 +276,25 @@ def test_equivariant_vicreg_rotation_group_must_match_the_trainer():
     check_hypers(hypers, cutoff=4.0)
 
 
-def test_equivariant_vicreg_needs_student_rotations():
-    hypers = _hypers("high_order_equivariant_vicreg")
+@pytest.mark.parametrize(
+    "preset, term",
+    [
+        ("high_order_equivariant_vicreg", "equivariant_vicreg"),
+        ("high_order_vicreg_averaged", "vicreg_averaged"),
+    ],
+)
+def test_rotation_terms_need_student_rotations(preset, term):
+    hypers = _hypers(preset)
     hypers["rotation_group"] = "none"
-    with pytest.raises(ValueError, match="'none'"):
+    with pytest.raises(ValueError, match=f"'{term}' term needs random student"):
         check_hypers(hypers, cutoff=4.0)
+
+
+@pytest.mark.parametrize("preset", IMPLEMENTED)
+def test_preset_does_not_write_the_rotation_group(preset):
+    assert "rotation_group" not in PRESETS[preset]
+    hypers = apply_preset(preset, {"rotation_group": "SO3"})
+    assert hypers["rotation_group"] == "SO3"
 
 
 def test_mtt_train_with_the_analytic_preset(monkeypatch, tmp_path):
@@ -331,3 +346,55 @@ def test_mtt_train_with_the_analytic_preset(monkeypatch, tmp_path):
     saved = checkpoint["grad_jepa"]["terms_state_dict"]
     assert any(key.startswith("residual_multipole.") for key in saved)
     assert (tmp_path / "model.pt").exists()
+
+
+def _dump(tmp_path, preset, base=None):
+    command = [
+        sys.executable,
+        "-W",
+        "error::RuntimeWarning",
+        "-m",
+        "metatrain.experimental.ssl_pretraining.high_order.presets",
+        "dump",
+        preset,
+        "-o",
+        str(tmp_path / "out.yaml"),
+    ]
+    if base is not None:
+        (tmp_path / "base.yaml").write_text(yaml.safe_dump(base))
+        command += ["--base", str(tmp_path / "base.yaml")]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    return yaml.safe_load((tmp_path / "out.yaml").read_text())
+
+
+@pytest.mark.parametrize("preset", IMPLEMENTED)
+def test_dump_validates_and_survives_the_merge(preset, tmp_path):
+    dumped = _dump(tmp_path, preset, base={"num_epochs": 1})
+    assert dumped == apply_preset(preset, {"num_epochs": 1})
+    terms = dumped["objective"]["terms"]
+    assert set(terms) == set(TermsHypers.__annotations__)
+    assert {k for k, v in terms.items() if v is not None} == EXPECTED_TERMS[preset]
+    # the dumped YAML is a valid ``architecture.training`` section; ``mtt train``
+    # merges it over the defaults, which must not bring back disabled terms
+    defaults = get_default_hypers(NAME)
+    merged = OmegaConf.to_container(OmegaConf.merge(defaults, {"training": dumped}))
+    assert _active(merged["training"]) == EXPECTED_TERMS[preset]
+    check_architecture_options(name=NAME, options=merged)
+    check_hypers(merged["training"], cutoff=4.0)
+
+
+def test_dump_without_base_and_with_a_pending_preset(tmp_path):
+    assert _dump(tmp_path, "high_order_sigreg") == apply_preset("high_order_sigreg", {})
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "metatrain.experimental.ssl_pretraining.high_order.presets",
+            "dump",
+            "high_order",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "teacher terms" in result.stderr
