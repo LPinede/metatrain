@@ -234,7 +234,10 @@ def test_from_hypers_takes_dims_from_the_context():
 def test_check_hypers_requires_the_second_rotation(name, small_batch):
     _, _, hypers = small_batch
     hypers = copy.deepcopy(hypers)
-    hypers["objective"]["terms"][name] = _term_defaults()[name]
+    # the term alone (it is also the anti-collapse term) or with ``vicreg``
+    hypers["objective"]["terms"] = {name: _term_defaults()[name]}
+    if name == "equivariant_vicreg":
+        hypers["objective"]["terms"]["vicreg"] = {"variance": 1.0, "covariance": 0.04}
     hypers["views"]["builder"] = "high_order"
     with pytest.raises(ValueError, match="second_rotation"):
         check_hypers(hypers, 4.0)

@@ -21,21 +21,25 @@ DEFAULTS = {
     "mode_window": 3.0,
     "max_centers": 4,
     "teacher_pair": True,
-    "l_max_multipole": 4,
-    "l_max_latent": 4,
-    "n_radial": 6,
-    "analytic_weight": 1.0,
-    "teacher_weight": 1.0,
-    "warmup_fraction": 0.05,
-    "floor_gamma": 0.1,
-    "chirality_weight": 0.1,
-    "chirality_types": [1, 6, 8],
-    "head_inputs": "node",
-    "anchor_channel_fraction": 1.0,
-    "anti_collapse": "vicreg",
     "second_rotation": False,
-    "equivariant_vicreg_weight": 0.1,
 }
+
+# term settings: they live in the term entries of ``objective.terms`` only
+TERM_SETTINGS = [
+    "l_max_multipole",
+    "l_max_latent",
+    "n_radial",
+    "analytic_weight",
+    "teacher_weight",
+    "warmup_fraction",
+    "floor_gamma",
+    "chirality_weight",
+    "chirality_types",
+    "head_inputs",
+    "anchor_channel_fraction",
+    "anti_collapse",
+    "equivariant_vicreg_weight",
+]
 
 
 def test_defaults_reach_the_trainer_hypers():
@@ -60,13 +64,19 @@ def _check(**over):
 
 
 def test_valid_overrides_pass():
-    _check(p_def=0.0, teacher_pair=False, head_inputs="node_edge", iid_sigma=0.0)
-    _check(p_def=1.0, anti_collapse="sigreg", max_centers=1)
+    _check(p_def=0.0, teacher_pair=False, iid_sigma=0.0)
+    _check(p_def=1.0, second_rotation=True, max_centers=1)
 
 
 def test_unknown_key_rejected():
     with pytest.raises(MetatrainValidationError, match="p_deff"):
         _check(p_deff=0.5)
+
+
+@pytest.mark.parametrize("key", TERM_SETTINGS)
+def test_term_settings_are_not_high_order_keys(key):
+    with pytest.raises(MetatrainValidationError, match=key):
+        _check(**{key: 1})
 
 
 @pytest.mark.parametrize(
@@ -82,20 +92,6 @@ def test_unknown_key_rejected():
         {"mode_amplitude": 0.0},
         {"mode_window": 0.0},
         {"max_centers": 0},
-        {"l_max_multipole": -1},
-        {"l_max_latent": -1},
-        {"n_radial": 0},
-        {"analytic_weight": -1.0},
-        {"teacher_weight": -1.0},
-        {"warmup_fraction": 1.5},
-        {"floor_gamma": -0.1},
-        {"chirality_weight": -0.1},
-        {"chirality_types": []},
-        {"head_inputs": "edge"},
-        {"anchor_channel_fraction": 0.0},
-        {"anchor_channel_fraction": 1.5},
-        {"anti_collapse": "barlow"},
-        {"equivariant_vicreg_weight": -0.1},
     ],
 )
 def test_out_of_range_rejected(over):

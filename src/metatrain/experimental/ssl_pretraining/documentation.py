@@ -328,5 +328,10 @@ class TrainerHypers(TypedDict):
     """Predictor hyperparameters."""
     objective: ObjectiveHypers = init_with_defaults(ObjectiveHypers)
     """The loss terms and their weights."""
+    allow_no_anti_collapse: bool = False
+    """Whether ``objective.terms`` may hold no anti-collapse term. Exactly one of
+    ``vicreg``, ``sigreg`` and ``vicreg_averaged`` must be active otherwise. Set it
+    only for the design-pilot arms without anti-collapse term, which test whether
+    the representation collapses."""
     high_order: HighOrderHypers = init_with_defaults(HighOrderHypers)
-    """The high-order SSL method (views, targets and loss balancing)."""
+    """The views of the high-order SSL method (with ``views.builder: high_order``)."""

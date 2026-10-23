@@ -1,5 +1,5 @@
-"""Hyperparameters of the high-order SSL method (``training.high_order``) and of
-its loss terms (entries of ``training.objective.terms``).
+"""Hyperparameters of the high-order views (``training.high_order``) and of the
+high-order loss terms (entries of ``training.objective.terms``).
 
 This module is the single source of the defaults. It must stay torch-free: the
 shared ``documentation.py`` imports it.
@@ -37,12 +37,6 @@ def _non_negative(value: float) -> float:
     return value
 
 
-def _not_empty(value: list) -> list:
-    if len(value) == 0:
-        raise ValueError("must not be empty")
-    return value
-
-
 Probability = Annotated[float, AfterValidator(_probability)]
 PositiveFloat = Annotated[float, AfterValidator(_positive)]
 NonNegativeFloat = Annotated[float, AfterValidator(_non_negative)]
@@ -51,8 +45,10 @@ NonNegativeInt = Annotated[int, AfterValidator(_non_negative)]
 
 
 class HighOrderHypers(TypedDict):
-    """Views, targets and loss balancing of the high-order SSL method (used with
-    ``views.builder: high_order``)."""
+    """Views of the high-order SSL method (used with ``views.builder: high_order``).
+
+    The settings of the loss terms (orders, weights, head form) are the entries of
+    ``objective.terms`` only; the presets of ``high_order/presets.py`` set them."""
 
     p_def: Probability = 0.5
     """Probability that a structure takes the deform-only student branch (else the
@@ -81,39 +77,9 @@ class HighOrderHypers(TypedDict):
     teacher_pair: bool = True
     """Whether the teacher runs on the antithetic pair ``x0 ± u_T`` (else on
     ``x0 + u_T`` only, with the clean ``x0`` as the reference)."""
-    l_max_multipole: NonNegativeInt = 4
-    """Highest order of the residual multipole targets."""
-    l_max_latent: NonNegativeInt = 4
-    """Highest order of the rotation-conditioned latent prediction."""
-    n_radial: PositiveInt = 6
-    """Number of radial channels of the residual multipole targets."""
-    analytic_weight: NonNegativeFloat = 1.0
-    """Weight of the analytic terms (residual multipoles, deformation jets,
-    chirality)."""
-    teacher_weight: NonNegativeFloat = 1.0
-    """Weight of the teacher terms (rotation-conditioned latent, action response)."""
-    warmup_fraction: Probability = 0.05
-    """Fraction of the steps during which only the invariant part of the latent term
-    is active and the action-response term is off."""
-    floor_gamma: NonNegativeFloat = 0.1
-    """Variance floor of the l > 0 predictions, in units of the target standard
-    deviation of each block."""
-    chirality_weight: NonNegativeFloat = 0.1
-    """Weight of the chirality term relative to ``analytic_weight``."""
-    chirality_types: Annotated[list[int], AfterValidator(_not_empty)] = [1, 6, 8]
-    """Atomic types of the chirality channels."""
-    head_inputs: Literal["node", "node_edge"] = "node"
-    """Inputs of the per-block heads: the pooled per-atom feature (``node``), or a
-    node part plus a per-edge part summed over neighbours (``node_edge``)."""
-    anchor_channel_fraction: Annotated[float, AfterValidator(_fraction)] = 1.0
-    """Fraction of the token channels read by the heads of the analytic terms."""
-    anti_collapse: Literal["vicreg", "sigreg", "vicreg_averaged", "none"] = "vicreg"
-    """Anti-collapse term (``none`` only for the design pilots)."""
     second_rotation: bool = False
     """Whether a second student rotation is encoded (equivariant or averaged
     VICReg)."""
-    equivariant_vicreg_weight: NonNegativeFloat = 0.1
-    """Weight of the equivariant VICReg term (with ``second_rotation``)."""
 
 
 def _three_distinct(value: list) -> list:

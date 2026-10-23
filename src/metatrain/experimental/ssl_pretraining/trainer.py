@@ -474,13 +474,66 @@ def check_hypers(hypers: Dict[str, Any], cutoff: float) -> None:
         raise ValueError("`noise.skin` must be positive when noise is enabled")
     if hypers["views"]["builder"] == "high_order" and hypers["noise"]["skin"] <= 0:
         raise ValueError("`noise.skin` must be positive with the high_order views")
-    # these terms read the second student rotation of the high-order views
-    for name in ["equivariant_vicreg", "vicreg_averaged"]:
-        if hypers["objective"]["terms"].get(name) is None:
-            continue
-        if hypers["views"]["builder"] != "high_order":
+    check_term_combination(hypers)
+
+
+# the terms that keep the representation from collapsing
+ANTI_COLLAPSE_TERMS = ("vicreg", "sigreg", "vicreg_averaged")
+# the terms that read the Grad-JEPA views (latent and gradient targets)
+GRAD_JEPA_VIEW_TERMS = ("latent", "gradient", "gradient_spread")
+# the terms that read the extras of the high-order views
+HIGH_ORDER_VIEW_TERMS = (
+    "residual_multipole",
+    "deformation_jets",
+    "chirality",
+    "equivariant_vicreg",
+    "vicreg_averaged",
+)
+# the terms that read the second student rotation of the high-order views
+SECOND_ROTATION_TERMS = ("equivariant_vicreg", "vicreg_averaged")
+
+
+def check_term_combination(hypers: Dict[str, Any]) -> None:
+    """Validate the active loss terms against each other and against the views.
+
+    :param hypers: The trainer hypers.
+    :raises ValueError: If the active terms do not fit together or with the views.
+    """
+    terms = {k: v for k, v in hypers["objective"]["terms"].items() if v is not None}
+    builder = hypers["views"]["builder"]
+    for name in terms:
+        if name in HIGH_ORDER_VIEW_TERMS and builder != "high_order":
             raise ValueError(f"the '{name}' term needs `views.builder: high_order`")
-        if not hypers["high_order"]["second_rotation"]:
+        if name in GRAD_JEPA_VIEW_TERMS and builder == "high_order":
+            raise ValueError(
+                f"the '{name}' term needs the Grad-JEPA views (`views.builder: "
+                "grad_jepa`), not the high_order views"
+            )
+        if (
+            name in SECOND_ROTATION_TERMS
+            and not hypers["high_order"]["second_rotation"]
+        ):
             raise ValueError(
                 f"the '{name}' term needs `high_order.second_rotation: true`"
+            )
+    anti_collapse = [name for name in ANTI_COLLAPSE_TERMS if name in terms]
+    if len(anti_collapse) > 1 or (
+        len(anti_collapse) == 0 and not hypers["allow_no_anti_collapse"]
+    ):
+        raise ValueError(
+            f"`objective.terms` must hold exactly one anti-collapse term among "
+            f"{', '.join(ANTI_COLLAPSE_TERMS)} (got {len(anti_collapse)}); "
+            "`allow_no_anti_collapse: true` allows none (design pilots only)"
+        )
+    if "equivariant_vicreg" in terms:
+        group = terms["equivariant_vicreg"]["rotation_group"]
+        if hypers["rotation_group"] == "none":
+            raise ValueError(
+                "the 'equivariant_vicreg' term needs random student rotations "
+                "(`rotation_group` is 'none')"
+            )
+        if group != hypers["rotation_group"]:
+            raise ValueError(
+                f"the 'equivariant_vicreg' term's `rotation_group` ({group}) must "
+                f"equal the trainer's `rotation_group` ({hypers['rotation_group']})"
             )
