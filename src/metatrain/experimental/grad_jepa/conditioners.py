@@ -7,6 +7,12 @@ head and its invariants (norm and projections on the pair direction and on the
 relative displacement) enter the messages, so the predictor stays O(3)-covariant and
 linear in the probes for any conditioner, by construction.
 
+Contract for ``edge_inputs``: the edge centers include the masked target atoms, so
+a conditioner must not read teacher or target data at masked atoms (only information
+the student may know there); and the vectors must be polar (they flip sign under
+inversion, like positions): pseudovectors such as cross products break
+O(3)-covariance for improper transformations.
+
 A conditioner is a class with the attributes of :class:`Conditioner`, constructed
 from its hypers (``cls(**hypers)``, the entry of ``predictor.conditioners`` under its
 name). Add one with :func:`register_conditioner`, together with its hypers
