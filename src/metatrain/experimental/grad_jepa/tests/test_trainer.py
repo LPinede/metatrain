@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from metatrain.experimental.grad_jepa import objective
+from metatrain.experimental.grad_jepa import terms as terms_module
 from metatrain.experimental.grad_jepa import trainer as trainer_module
 from metatrain.experimental.grad_jepa.documentation import TrainerHypers
 from metatrain.experimental.grad_jepa.trainer import (
@@ -92,7 +93,37 @@ def test_check_hypers(path, value, match):
         check_hypers(hypers, cutoff=4.5)
 
 
-def test_train_save_resume_and_finetune(tmp_path):
+def _assert_same_tensors(state, expected) -> None:
+    assert set(state) == set(expected)
+    for name, value in expected.items():
+        if isinstance(value, torch.Tensor):  # skip ``_extra_state`` entries
+            torch.testing.assert_close(state[name], value, rtol=0, atol=0)
+
+
+def _spy_first_step(monkeypatch) -> dict:
+    """Record the student, teacher, predictor and term states at the first step."""
+    first: dict = {}
+    loss_function = trainer_module.grad_jepa_loss
+
+    def spy(student, teacher, predictor, terms, *args, **kwargs):
+        if not first:
+            modules = {
+                "student": student,
+                "teacher": teacher,
+                "predictor": predictor,
+            }
+            for term in terms:
+                if isinstance(term, torch.nn.Module):
+                    modules[f"term:{term.name}"] = term
+            for name, module in modules.items():
+                first[name] = copy.deepcopy(module.state_dict())
+        return loss_function(student, teacher, predictor, terms, *args, **kwargs)
+
+    monkeypatch.setattr(trainer_module, "grad_jepa_loss", spy)
+    return first
+
+
+def test_train_save_resume_and_finetune(tmp_path, monkeypatch):
     torch.manual_seed(0)
     dataset = _dataset()
     trainer = Trainer(_trainer_hypers(checkpoint_interval=10))
@@ -106,11 +137,14 @@ def test_train_save_resume_and_finetune(tmp_path):
     checkpoint = torch.load(path, weights_only=False)
     assert checkpoint["core"]["architecture_name"] == "pet"
     assert checkpoint["epoch"] == 1
+    assert checkpoint["trainer_ckpt_version"] == 2
     assert set(checkpoint["grad_jepa"]) == {
         "step",
         "teacher_state_dict",
         "predictor_state_dict",
+        "terms_state_dict",
     }
+    assert checkpoint["grad_jepa"]["terms_state_dict"] == {}
     # epoch 0 and the last epoch are always saved
     assert (tmp_path / "model_0.ckpt").exists()
     assert (tmp_path / "model_1.ckpt").exists()
@@ -124,6 +158,7 @@ def test_train_save_resume_and_finetune(tmp_path):
         )
 
     # resume one more epoch with ``restart_from``
+    first = _spy_first_step(monkeypatch)
     resumed = Trainer(_trainer_hypers(num_epochs=3, restart_from=str(path)))
     resumed_model = resumed.setup(small_model_hypers(), INFO)
     resumed.train(
@@ -136,6 +171,14 @@ def test_train_save_resume_and_finetune(tmp_path):
     )
     assert resumed.epoch == 2
     assert resumed.step == 3 * checkpoint["grad_jepa"]["step"] // 2
+    # the first resumed step sees the saved student, teacher and predictor
+    _assert_same_tensors(first["student"], model.core.state_dict())
+    _assert_same_tensors(
+        first["teacher"], checkpoint["grad_jepa"]["teacher_state_dict"]
+    )
+    _assert_same_tensors(
+        first["predictor"], checkpoint["grad_jepa"]["predictor_state_dict"]
+    )
 
     # the checkpoint fine-tunes as a plain PET with a new energy target
     pet = model_from_checkpoint(copy.deepcopy(checkpoint), context="finetune")
@@ -308,3 +351,125 @@ def test_train_and_restart_on_mps(tmp_path, monkeypatch):
     _train_then_restart(tmp_path, torch.device("mps"))
     assert len(seen) > 0
     assert all(devices == {"mps"} for devices in seen)
+
+
+class _ScaleTerm(torch.nn.Module):
+    """A test-only term with a parameter and a buffer counting training calls."""
+
+    name = "scale"
+    needs_gradients = False
+
+    def __init__(self, weight: float) -> None:
+        super().__init__()
+        self.weight = weight
+        self.required_targets: dict = {}
+        # float64, so that the test can check the trainer's dtype move
+        self.scale = torch.nn.Parameter(torch.ones((), dtype=torch.float64))
+        self.register_buffer("training_calls", torch.zeros((), dtype=torch.float64))
+
+    def forward(self, step):
+        if self.training:
+            self.training_calls += 1
+        loss = self.weight * (self.scale * step.student_features).pow(2).mean()
+        return loss, {"scale": self.scale.detach()}
+
+
+def _with_scale_term(monkeypatch, **overrides) -> dict:
+    monkeypatch.setitem(terms_module.TERMS, "scale", _ScaleTerm)
+    hypers = _trainer_hypers(**overrides)
+    hypers["objective"]["terms"]["scale"] = {"weight": 1.0}
+    return hypers
+
+
+def test_parametric_term_is_trained_saved_and_restored(tmp_path, monkeypatch):
+    torch.manual_seed(0)
+    dataset = _dataset()
+    trainer = Trainer(_with_scale_term(monkeypatch, num_epochs=2))
+    model = trainer.setup(small_model_hypers(), INFO)
+    trainer.train(
+        model, torch.float32, [torch.device("cpu")], [dataset], [dataset], str(tmp_path)
+    )
+    path = tmp_path / "ssl.ckpt"
+    trainer.save_checkpoint(model, path)
+    state = torch.load(path, weights_only=False)["grad_jepa"]["terms_state_dict"]
+    assert set(state) == {"scale.scale", "scale.training_calls"}
+    # moved to the training dtype, and trained by the optimizer
+    assert state["scale.scale"].dtype == torch.float32
+    assert state["scale.scale"] != 1.0
+    # in training mode for the training steps of both epochs, not for validation
+    assert state["scale.training_calls"] == trainer.step
+
+    first = _spy_first_step(monkeypatch)
+    resumed = Trainer(
+        _with_scale_term(monkeypatch, num_epochs=3, restart_from=str(path))
+    )
+    resumed_model = resumed.setup(small_model_hypers(), INFO)
+    resumed.train(
+        resumed_model,
+        torch.float32,
+        [torch.device("cpu")],
+        [dataset],
+        [dataset],
+        str(tmp_path),
+    )
+    _assert_same_tensors(
+        {f"scale.{name}": value for name, value in first["term:scale"].items()}, state
+    )
+    assert resumed.terms_state_dict["scale.training_calls"] == resumed.step
+
+
+def _v1_checkpoint(tmp_path) -> dict:
+    """A checkpoint as saved by trainer version 1 (no term state)."""
+    torch.manual_seed(0)
+    dataset = _dataset()
+    trainer = Trainer(_trainer_hypers(num_epochs=1))
+    model = trainer.setup(small_model_hypers(), INFO)
+    trainer.train(
+        model, torch.float32, [torch.device("cpu")], [dataset], [dataset], str(tmp_path)
+    )
+    trainer.save_checkpoint(model, tmp_path / "ssl.ckpt")
+    checkpoint = torch.load(tmp_path / "ssl.ckpt", weights_only=False)
+    checkpoint["trainer_ckpt_version"] = 1
+    checkpoint["grad_jepa"].pop("terms_state_dict", None)
+    return checkpoint
+
+
+def test_upgrade_checkpoint_v1_to_v2(tmp_path):
+    checkpoint = Trainer.upgrade_checkpoint(_v1_checkpoint(tmp_path))
+    assert checkpoint["trainer_ckpt_version"] == 2
+    assert checkpoint["grad_jepa"]["terms_state_dict"] == {}
+
+
+def test_restart_from_upgrades_a_v1_checkpoint(tmp_path):
+    path = tmp_path / "v1.ckpt"
+    torch.save(_v1_checkpoint(tmp_path), path)
+    resumed = Trainer(_trainer_hypers(num_epochs=2, restart_from=str(path)))
+    resumed_model = resumed.setup(small_model_hypers(), INFO)
+    resumed.train(
+        resumed_model,
+        torch.float32,
+        [torch.device("cpu")],
+        [_dataset()],
+        [_dataset()],
+        str(tmp_path),
+    )
+    assert resumed.epoch == 1
+
+
+@pytest.mark.parametrize("version", [0, 99])
+def test_restart_from_rejects_unknown_versions(tmp_path, version):
+    checkpoint = _v1_checkpoint(tmp_path)
+    checkpoint["trainer_ckpt_version"] = version
+    path = tmp_path / "unknown.ckpt"
+    torch.save(checkpoint, path)
+    trainer = Trainer(_trainer_hypers(restart_from=str(path)))
+    model = trainer.setup(small_model_hypers(), INFO)
+    with pytest.raises((RuntimeError, ValueError), match=f"version {version}"):
+        trainer.train(
+            model,
+            torch.float32,
+            [torch.device("cpu")],
+            [_dataset()],
+            [_dataset()],
+            str(tmp_path),
+        )

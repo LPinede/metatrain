@@ -9,7 +9,7 @@ from metatrain.pet import PET
 from metatrain.pet import Trainer as PETTrainer
 from metatrain.pet.trainer import get_scheduler
 from metatrain.scaler import Scaler
-from metatrain.utils.abc import TrainerInterface
+from metatrain.utils.abc import TrainerInterface, common_upgrade_checkpoint
 from metatrain.utils.architectures import get_default_hypers
 from metatrain.utils.augmentation import O3Augmenter
 from metatrain.utils.data import (
@@ -29,6 +29,7 @@ from metatrain.utils.logging import ROOT_LOGGER, MetricLogger
 from metatrain.utils.transfer import batch_to
 from metatrain.utils.wrapper import MetatrainModel
 
+from . import checkpoints
 from .conditioners import build_conditioners
 from .objective import grad_jepa_loss
 from .predictor import GradJEPAPredictor
@@ -51,7 +52,7 @@ def ema_update(teacher: torch.nn.Module, student: torch.nn.Module, tau: float) -
 
 
 class Trainer(TrainerInterface):
-    __checkpoint_version__ = 1
+    __checkpoint_version__ = 2
 
     def __init__(self, hypers: Dict[str, Any]) -> None:
         super().__init__(hypers)
@@ -65,6 +66,7 @@ class Trainer(TrainerInterface):
         self.best_optimizer_state_dict: Optional[Dict[str, Any]] = None
         self.teacher_state_dict: Optional[Dict[str, Any]] = None
         self.predictor_state_dict: Optional[Dict[str, Any]] = None
+        self.terms_state_dict: Optional[Dict[str, Any]] = None
 
     def setup(
         self, model_hypers: Dict[str, Any], dataset_info: DatasetInfo
@@ -111,18 +113,14 @@ class Trainer(TrainerInterface):
         student = model.core
         if hypers["restart_from"] is not None:
             self._load_restart_state(hypers["restart_from"], model)
-        # ``copy.deepcopy`` and ``load_state_dict`` leave metatensor Labels buffers
-        # (PET's ``single_label``) on the CPU: build and restore the teacher first,
-        # then move everything to the device
-        teacher = copy.deepcopy(student)
-        if self.teacher_state_dict is not None:
-            teacher.load_state_dict(self.teacher_state_dict)
-        model.to(device=device, dtype=dtype)
-        teacher.to(device=device, dtype=dtype)
         options = student.requested_neighbor_lists()[0]
         check_hypers(hypers, options.cutoff)
         terms = build_terms(hypers["objective"]["terms"])
         ROOT_LOGGER.info("Active loss terms: " + ", ".join(term.name for term in terms))
+        # the terms with parameters or state, by name
+        term_modules = torch.nn.ModuleDict(
+            {term.name: term for term in terms if isinstance(term, torch.nn.Module)}
+        )
         feature_dim = student.num_readout_layers * (student.d_node + student.d_pet)
         predictor = GradJEPAPredictor(
             feature_dim=feature_dim,
@@ -134,13 +132,22 @@ class Trainer(TrainerInterface):
             species_query=hypers["predictor"]["species_query"],
             num_layers=hypers["predictor"]["num_layers"],
             conditioners=build_conditioners(hypers["predictor"]["conditioners"]),
-        ).to(device=device, dtype=dtype)
+        )
+        teacher = copy.deepcopy(student)
+        if self.teacher_state_dict is not None:
+            teacher.load_state_dict(self.teacher_state_dict)
+        if self.predictor_state_dict is not None:
+            predictor.load_state_dict(self.predictor_state_dict)
+        if self.terms_state_dict is not None:
+            term_modules.load_state_dict(self.terms_state_dict)
+        # ``copy.deepcopy`` and ``load_state_dict`` leave metatensor Labels buffers
+        # (PET's ``single_label``) on the CPU: every copy and state load comes
+        # first, then everything is moved to the device
+        for module in [model, teacher, predictor, term_modules]:
+            module.to(device=device, dtype=dtype)
         teacher.eval()
         for parameter in teacher.parameters():
             parameter.requires_grad_(False)
-
-        if self.predictor_state_dict is not None:
-            predictor.load_state_dict(self.predictor_state_dict)
 
         collate_fn_train, collate_fn_val = get_collate_fns(options, hypers)
         if hypers["num_workers"] is None:
@@ -172,7 +179,11 @@ class Trainer(TrainerInterface):
         if len(val_dataloader) == 0:
             raise ValueError("grad_jepa needs a non-empty validation set")
 
-        parameters = list(student.parameters()) + list(predictor.parameters())
+        parameters = (
+            list(student.parameters())
+            + list(predictor.parameters())
+            + list(term_modules.parameters())
+        )
         optimizer = torch.optim.AdamW(
             parameters, lr=hypers["learning_rate"], weight_decay=hypers["weight_decay"]
         )
@@ -196,6 +207,7 @@ class Trainer(TrainerInterface):
             for sampler in epoch_samplers:
                 sampler.set_epoch(epoch)
             student.train()
+            term_modules.train()
             train_metrics: Dict[str, float] = {}
             n_train = 0
             for batch in train_dataloader:
@@ -225,6 +237,7 @@ class Trainer(TrainerInterface):
                 n_train += 1
 
             student.eval()
+            term_modules.eval()
             val_metrics: Dict[str, float] = {}
             n_val = 0
             for index, batch in enumerate(val_dataloader):
@@ -278,6 +291,7 @@ class Trainer(TrainerInterface):
             self.scheduler_state_dict = lr_scheduler.state_dict()
             self.teacher_state_dict = teacher.state_dict()
             self.predictor_state_dict = predictor.state_dict()
+            self.terms_state_dict = term_modules.state_dict()
             is_last = epoch == hypers["num_epochs"] - 1
             if epoch % hypers["checkpoint_interval"] == 0 or is_last:
                 self.save_checkpoint(
@@ -288,6 +302,17 @@ class Trainer(TrainerInterface):
         checkpoint = torch.load(path, weights_only=False, map_location="cpu")
         if "grad_jepa" not in checkpoint:
             raise ValueError(f"'{path}' is not a grad_jepa checkpoint")
+        version = checkpoint.get("trainer_ckpt_version")
+        if (
+            not isinstance(version, int)
+            or not 1 <= version <= self.__checkpoint_version__
+        ):
+            raise ValueError(
+                f"cannot resume from '{path}': its grad_jepa trainer checkpoint "
+                f"version {version} is not supported (this trainer reads versions 1 "
+                f"to {self.__checkpoint_version__})"
+            )
+        checkpoint = self.upgrade_checkpoint(checkpoint)
         previous = model_from_checkpoint(checkpoint, context="restart")
         model.load_state_dict(previous.state_dict())
         state = checkpoint["grad_jepa"]
@@ -303,6 +328,7 @@ class Trainer(TrainerInterface):
         self.best_optimizer_state_dict = checkpoint["best_optimizer_state_dict"]
         self.teacher_state_dict = state["teacher_state_dict"]
         self.predictor_state_dict = state["predictor_state_dict"]
+        self.terms_state_dict = state["terms_state_dict"]
 
     def save_checkpoint(self, model: MetatrainModel, path: Union[str, Path]) -> None:
         checkpoint = model.get_checkpoint(self.best_model_state_dict)
@@ -322,6 +348,7 @@ class Trainer(TrainerInterface):
                     "step": self.step,
                     "teacher_state_dict": self.teacher_state_dict,
                     "predictor_state_dict": self.predictor_state_dict,
+                    "terms_state_dict": self.terms_state_dict,
                 },
             }
         )
@@ -342,15 +369,9 @@ class Trainer(TrainerInterface):
     def upgrade_checkpoint(
         cls, checkpoint: Dict[str, Any], version: Optional[int] = None
     ) -> Dict[str, Any]:
-        if version is None:
-            version = cls.__checkpoint_version__
-        if checkpoint["trainer_ckpt_version"] != version:
-            raise RuntimeError(
-                "Unable to upgrade the checkpoint: the checkpoint is using trainer "
-                f"version {checkpoint['trainer_ckpt_version']}, while the current "
-                f"trainer version is {version}."
-            )
-        return checkpoint
+        return common_upgrade_checkpoint(
+            checkpoint, version, cls.__checkpoint_version__, "trainer", checkpoints
+        )
 
 
 def _with_core(model: MetatrainModel, core: torch.nn.Module) -> Dict[str, Any]:

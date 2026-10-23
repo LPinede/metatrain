@@ -9,6 +9,12 @@ hypers ``TypedDict`` as a ``NotRequired[Optional[...]]`` entry of ``TermsHypers`
 :func:`build_terms` runs. Under ``mtt train`` the options are merged with the
 defaults, so a default term omitted from the options stays enabled: disable it
 with ``null``.
+
+A term may be a :class:`torch.nn.Module` with parameters or buffers. The trainer
+then moves it to the training device and dtype, trains its parameters with the
+student's optimizer (and gradient clipping), switches it between ``train()`` and
+``eval()`` together with the student, and saves and restores its ``state_dict``
+under the term's name in the checkpoint (``grad_jepa.terms_state_dict``).
 """
 
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, TypeVar
