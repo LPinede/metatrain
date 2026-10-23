@@ -65,6 +65,11 @@ component_management:
       paths:
         - "src/metatrain/experimental/classifier/.*"
 
+    - component_id: grad_jepa
+      name: Grad-JEPA
+      paths:
+        - "src/metatrain/experimental/grad_jepa/.*"
+
     - component_id: mace
       name: MACE
       paths:

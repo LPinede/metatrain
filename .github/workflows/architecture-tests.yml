@@ -26,6 +26,7 @@ jobs:
           - dpa3
           - scaler
           - lorem
+          - grad-jepa
 
     runs-on: ubuntu-24.04
 
