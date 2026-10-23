@@ -1,6 +1,7 @@
 import copy
 from dataclasses import fields
 
+import ase.io
 import pytest
 import torch
 from metatomic.torch import System
@@ -18,6 +19,7 @@ from metatrain.experimental.ssl_pretraining.objective import (
     RESERVED_EXTRAS,
     VIEW_BUILDERS,
 )
+from metatrain.experimental.ssl_pretraining.tests import QM9_PATH
 from metatrain.experimental.ssl_pretraining.views import pair_vectors
 
 
@@ -575,3 +577,20 @@ def test_student_smooth_field_has_no_rigid_rotation(large_batch):
     molecule = ho.structure_index == 0
     positions = systems[0].positions.detach()
     assert _rigid_rotation_fit(positions, ho.u_smooth[molecule]).norm() < 1e-10
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_near_linear_structures_keep_their_gradient_scale(seed):
+    """A nearly linear molecule (QM9 frame 24, C2N2, and a synthetic 3-atom chain
+    bent by 1e-3 Å) loses only the perpendicular rotations: its unidentifiable
+    axial rotation is not fitted, so the gradient is not inflated."""
+    chain = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.2, 1e-3, 0.0], [2.4, 0.0, 0.0]], dtype=torch.float64
+    )
+    c2n2 = torch.tensor(ase.io.read(QM9_PATH, 24).positions, dtype=torch.float64)
+    for positions in (chain, c2n2):
+        generator = torch.Generator().manual_seed(seed)
+        u, grad = smooth_field_with_gradient(positions, 0.15, 8.0, 6, generator)
+        u_proj, grad_proj = ho_views._remove_rigid_rotation(positions, u, grad)
+        assert grad_proj.abs().max() <= 2 * grad.abs().max()
+        assert u_proj.abs().max() <= 2 * u.abs().max()

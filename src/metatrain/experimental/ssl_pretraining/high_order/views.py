@@ -94,6 +94,11 @@ def _min_image(
     return frac @ cell
 
 
+MIN_RELATIVE_INERTIA = 1e-3
+"""Principal moments of inertia below this fraction of the trace mark rotation axes
+that are not fitted by :func:`_remove_rigid_rotation`."""
+
+
 def _remove_rigid_rotation(
     positions: torch.Tensor, field: torch.Tensor, gradient: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -102,9 +107,11 @@ def _remove_rigid_rotation(
     antisymmetric gradient ``[w]_x`` of that rotation from its gradient.
 
     A rigid rotation of the student structure cannot be told apart from a change
-    of ``g_S``, so it is not a learnable displacement target. For a linear
-    structure only the rotation about the axis is left (the pseudo-inverse drops
-    the unidentifiable axial component); a single atom is unchanged.
+    of ``g_S``, so it is not a learnable displacement target. Rotations about
+    principal axes of (nearly) vanishing inertia, below
+    :data:`MIN_RELATIVE_INERTIA` of the trace, are not fitted: their angular
+    velocity is unidentifiable and would blow up (the axial rotation of a nearly
+    linear molecule; every rotation of a single atom).
 
     :param positions: Positions, shape ``(n_atoms, 3)``.
     :param field: Field at the atoms, shape ``(n_atoms, 3)``.
@@ -118,9 +125,11 @@ def _remove_rigid_rotation(
     eye = torch.eye(3, dtype=torch.float64)
     inertia = (r * r).sum() * eye - r.T @ r
     scale = float(inertia.diagonal().sum().clamp(min=1e-30))
-    omega = torch.linalg.pinv(inertia / scale, hermitian=True, rtol=1e-8) @ (
-        torch.cross(r, u, dim=-1).sum(dim=0) / scale
-    )
+    eigenvalues, axes = torch.linalg.eigh(inertia / scale)
+    # solve along the well-conditioned principal axes only
+    kept = eigenvalues > MIN_RELATIVE_INERTIA
+    torque = axes.T @ torch.cross(r, u, dim=-1).sum(dim=0) / scale
+    omega = axes[:, kept] @ (torque[kept] / eigenvalues[kept])
     zero = torch.zeros((), dtype=torch.float64)
     wx, wy, wz = omega.unbind()
     # cross-product matrix: skew @ v = w x v
