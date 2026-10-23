@@ -8,6 +8,7 @@ from metatomic.torch import System
 from metatrain.experimental.ssl_pretraining.high_order import views as ho_views
 from metatrain.experimental.ssl_pretraining.high_order.deformations import (
     shear_matrix,
+    smooth_field_with_gradient,
 )
 from metatrain.experimental.ssl_pretraining.high_order.views import (
     HighOrderExtras,
@@ -466,7 +467,11 @@ def test_grad_smooth_is_the_gradient_of_u_smooth(large_batch, monkeypatch, perio
         generator.set_state(state)
         return original(x, *args, generator)
 
-    u0, _ = field(positions)
+    u0, g0 = field(positions)
+    if not periodic:
+        # the stored field has its rigid rotation removed (a constant gradient,
+        # which the comparison below, relative to the mean gradient, ignores)
+        u0, _ = ho_views._remove_rigid_rotation(positions, u0, g0)
     scale = ho.u_smooth[atoms].norm() / (u0 - u0.mean(0)).norm()
     torch.testing.assert_close(ho.u_smooth[atoms], scale * (u0 - u0.mean(0)))
     h = 1e-5
@@ -504,3 +509,69 @@ def test_check_hypers_requires_a_skin():
     hypers["noise"]["skin"] = 0.0
     with pytest.raises(ValueError, match="high_order"):
         check_hypers(hypers, cutoff=4.0)
+
+
+def _rigid_rotation_fit(positions, u):
+    """Least-squares angular velocity w of ``u ~ w x (r - centroid)``."""
+    r = positions - positions.mean(dim=0)
+    inertia = (r * r).sum() * torch.eye(3, dtype=r.dtype) - r.T @ r
+    return torch.linalg.pinv(inertia) @ torch.cross(r, u, dim=-1).sum(dim=0)
+
+
+def test_rigid_rotation_is_projected_out():
+    """The projected field has no rigid-rotation part, and the projected gradient is
+    its exact gradient (finite differences, the removed rotation held fixed)."""
+    generator = torch.Generator().manual_seed(3)
+    positions = 3.0 * torch.randn(12, 3, generator=generator, dtype=torch.float64)
+    args = (0.15, 8.0, 6)
+    state = generator.get_state()
+
+    def field(x):
+        g = torch.Generator()
+        g.set_state(state)
+        return smooth_field_with_gradient(x, *args, g)
+
+    u, grad = field(positions)
+    assert _rigid_rotation_fit(positions, u).norm() > 1e-4
+    u_proj, grad_proj = ho_views._remove_rigid_rotation(positions, u, grad)
+    assert _rigid_rotation_fit(positions, u_proj).norm() < 1e-12
+
+    # the removed part is w x (r - c), with the constant gradient [w]_x
+    removed = grad - grad_proj
+    torch.testing.assert_close(removed, removed[:1].expand_as(removed))
+    torch.testing.assert_close(removed[0], -removed[0].T)
+    center = positions.mean(dim=0)
+    torch.testing.assert_close(u - u_proj, (positions - center) @ removed[0].T)
+
+    h = 1e-5
+    numeric = torch.zeros_like(grad)
+    for b in range(3):
+        e = torch.zeros(3, dtype=torch.float64)
+        e[b] = h
+        # every atom moves (the field's subtracted mean moves too); c is fixed
+        up = field(positions + e)[0] - (positions + e - center) @ removed[0].T
+        um = field(positions - e)[0] - (positions - e - center) @ removed[0].T
+        numeric[:, :, b] = (up - um) / (2 * h)
+    # the uniform shift also moves the field's mean: minus the mean raw gradient
+    torch.testing.assert_close(numeric, grad_proj - grad.mean(0), atol=1e-7, rtol=1e-6)
+
+
+def test_degenerate_structures_keep_a_finite_field():
+    """A single atom and a collinear dimer: no (or an axial) rigid rotation."""
+    for positions in (
+        torch.zeros(1, 3, dtype=torch.float64),
+        torch.tensor([[0.0, 0.0, 0.0], [0.3, 0.4, 1.2]], dtype=torch.float64),
+    ):
+        u = torch.randn(len(positions), 3, dtype=torch.float64)
+        grad = torch.randn(len(positions), 3, 3, dtype=torch.float64)
+        u_proj, grad_proj = ho_views._remove_rigid_rotation(positions, u, grad)
+        assert torch.isfinite(u_proj).all() and torch.isfinite(grad_proj).all()
+        assert _rigid_rotation_fit(positions, u_proj).norm() < 1e-10
+
+
+def test_student_smooth_field_has_no_rigid_rotation(large_batch):
+    systems, _, v = _views(large_batch, p_def=1.0)
+    ho = v.extras["high_order"]
+    molecule = ho.structure_index == 0
+    positions = systems[0].positions.detach()
+    assert _rigid_rotation_fit(positions, ho.u_smooth[molecule]).norm() < 1e-10

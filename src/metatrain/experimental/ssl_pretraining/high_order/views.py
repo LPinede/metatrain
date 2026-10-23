@@ -3,7 +3,9 @@
 - **Student:** per structure, a mask-only branch (probability ``1 - p_def``: the
   clean structure, masked as in Grad-JEPA) or a deform-only branch (the structure
   displaced by ``u_S`` = a smooth random field plus iid noise, unmasked), rotated by
-  a random ``g_S`` (``rotation_group``).
+  a random ``g_S`` (``rotation_group``). The smooth field of a non-periodic
+  structure has its rigid rotation removed (it would be indistinguishable from a
+  change of ``g_S``).
 - **Teacher:** the unrotated structure displaced both ways, ``x0 ± u_T``, where
   ``u_T`` is the sum of windowed l=1 modes (dilation, rotation, shear) with Gaussian
   amplitudes at a few centres far from the masked atoms. ``Views.teacher`` is the
@@ -90,6 +92,47 @@ def _min_image(
     frac = vectors @ torch.linalg.inv(cell)
     frac = torch.where(pbc, frac - torch.round(frac), frac)
     return frac @ cell
+
+
+def _remove_rigid_rotation(
+    positions: torch.Tensor, field: torch.Tensor, gradient: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Subtract from a non-periodic field its least-squares rigid infinitesimal
+    rotation ``w x (r - c)`` about the centroid ``c``, and the constant
+    antisymmetric gradient ``[w]_x`` of that rotation from its gradient.
+
+    A rigid rotation of the student structure cannot be told apart from a change
+    of ``g_S``, so it is not a learnable displacement target. For a linear
+    structure only the rotation about the axis is left (the pseudo-inverse drops
+    the unidentifiable axial component); a single atom is unchanged.
+
+    :param positions: Positions, shape ``(n_atoms, 3)``.
+    :param field: Field at the atoms, shape ``(n_atoms, 3)``.
+    :param gradient: Its exact gradient, shape ``(n_atoms, 3, 3)``.
+    :return: The projected field and its exact gradient.
+    """
+    centered = positions - positions.mean(dim=0)
+    # the 3x3 fit runs on CPU in float64 (MPS has no float64)
+    r, u = centered.detach().cpu().double(), field.detach().cpu().double()
+    # normal equations of min_w sum_i |u_i - w x r_i|^2: I w = sum_i r_i x u_i
+    eye = torch.eye(3, dtype=torch.float64)
+    inertia = (r * r).sum() * eye - r.T @ r
+    scale = float(inertia.diagonal().sum().clamp(min=1e-30))
+    omega = torch.linalg.pinv(inertia / scale, hermitian=True, rtol=1e-8) @ (
+        torch.cross(r, u, dim=-1).sum(dim=0) / scale
+    )
+    zero = torch.zeros((), dtype=torch.float64)
+    wx, wy, wz = omega.unbind()
+    # cross-product matrix: skew @ v = w x v
+    skew = torch.stack(
+        [
+            torch.stack([zero, -wz, wy]),
+            torch.stack([wz, zero, -wx]),
+            torch.stack([-wy, wx, zero]),
+        ]
+    )
+    skew = skew.to(field)
+    return field - centered @ skew.T, gradient - skew
 
 
 def _student_displacement(
@@ -263,12 +306,15 @@ def build_high_order_views(
                     generator,
                 )
             else:
-                field = smooth_field_with_gradient(
+                field = _remove_rigid_rotation(
                     positions,
-                    ho["field_amplitude"],
-                    ho["wavelength"],
-                    ho["n_waves"],
-                    generator,
+                    *smooth_field_with_gradient(
+                        positions,
+                        ho["field_amplitude"],
+                        ho["wavelength"],
+                        ho["n_waves"],
+                        generator,
+                    ),
                 )
             iid = ho["iid_sigma"] * torch.randn(
                 n_atoms, 3, generator=generator, dtype=torch.float64
