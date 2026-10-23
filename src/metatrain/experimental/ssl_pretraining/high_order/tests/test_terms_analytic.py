@@ -276,7 +276,10 @@ def test_degenerate_batches_are_finite(tiny_step_data):
 
 
 def test_terms_are_registered_after_the_grad_jepa_terms():
-    assert list(TERMS)[-3:] == HIGH_ORDER_TERMS
+    names = list(TERMS)
+    start = names.index(HIGH_ORDER_TERMS[0])
+    assert names[start : start + 3] == HIGH_ORDER_TERMS
+    assert start >= 4  # after the Grad-JEPA terms
     for name in HIGH_ORDER_TERMS:
         assert TERMS[name].name == name
         assert name in TermsHypers.__annotations__

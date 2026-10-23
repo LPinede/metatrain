@@ -177,3 +177,35 @@ class ChiralityTermHypers(TypedDict):
     """Atomic types of the three dipole channels."""
     head: AnchorHeadHypers = init_with_defaults(AnchorHeadHypers)
     """Form of the head."""
+
+
+class EquivariantVicregTermHypers(TypedDict):
+    """``equivariant_vicreg`` term: for every irrep block ``(l, sigma)`` with
+    ``1 <= l <= l_max``, a linear projector of the pooled student feature is applied
+    to two rotations of the same student input and mapped back to the teacher frame;
+    the term asks the two back-mapped outputs to agree, and each block to spread
+    (variance hinge) and decorrelate (channel covariance). Needs
+    ``high_order.second_rotation``."""
+
+    weight: NonNegativeFloat = 0.1
+    """Weight of the term."""
+    l_max: PositiveInt = 2
+    """Highest order of the projected blocks."""
+    channels: PositiveInt = 16
+    """Number of channels of each block."""
+    rotation_group: Literal["O3", "SO3"] = "O3"
+    """``O3``: proper and pseudo blocks of every order; ``SO3``: proper blocks only."""
+    warmup_fraction: Probability = 0.05
+    """The term is off for this fraction of the steps, then ramps linearly to its
+    weight over the same fraction."""
+
+
+class RotationAveragedVicregTermHypers(TypedDict):
+    """``vicreg_averaged`` term: the shared VICReg on the student features averaged
+    over two rotations of the same student input, at the rows of ``vicreg``. Needs
+    ``high_order.second_rotation``."""
+
+    variance: NonNegativeFloat = 1.0
+    """Weight of the variance hinge."""
+    covariance: NonNegativeFloat = 0.04
+    """Weight of the covariance penalty."""

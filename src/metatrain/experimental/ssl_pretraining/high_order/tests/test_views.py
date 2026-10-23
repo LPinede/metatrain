@@ -195,8 +195,8 @@ def test_one_sided_teacher(small_batch):
 
 
 def test_reproducible(large_batch):
-    _, _, a = _views(large_batch)
-    _, _, b = _views(large_batch)
+    _, _, a = _views(large_batch, second_rotation=True)
+    _, _, b = _views(large_batch, second_rotation=True)
     for f in fields(HighOrderExtras):
         assert torch.equal(
             getattr(a.extras["high_order"], f.name),
@@ -212,7 +212,7 @@ def test_reproducible(large_batch):
 
 def test_tiny_structures_have_no_centers_and_no_nan(tiny_batch):
     for p_def in (0.0, 1.0):
-        systems, _, v = _views(tiny_batch, p_def=p_def)
+        systems, _, v = _views(tiny_batch, p_def=p_def, second_rotation=True)
         ho = v.extras["high_order"]
         assert ho.centers.numel() == 0
         assert ho.center_amplitudes.shape == (0, 9)
@@ -263,7 +263,7 @@ def test_views_fields(large_batch):
 
 
 def test_extras_shapes_and_consistency(large_batch):
-    systems, options, v = _views(large_batch, p_def=0.5)
+    systems, options, v = _views(large_batch, p_def=0.5, second_rotation=True)
     ho = v.extras["high_order"]
     n_structures = len(systems)
     n_atoms = sum(len(s) for s in systems)
@@ -274,6 +274,7 @@ def test_extras_shapes_and_consistency(large_batch):
         "branch_masked": ((n_structures,), torch.bool),
         "branch_deformed": ((n_structures,), torch.bool),
         "rotations": ((n_atoms, 3, 3), dtype),
+        "rotations2": ((n_atoms, 3, 3), dtype),
         "u_student": ((n_atoms, 3), dtype),
         "grad_smooth": ((n_atoms, 3, 3), dtype),
         "u_smooth": ((n_atoms, 3), dtype),
@@ -389,9 +390,9 @@ def test_views_follow_the_device(large_batch, device):
     """Same random draws on every device: the views agree with the CPU ones."""
     systems, options, hypers = large_batch
     systems = [s.to(dtype=torch.float32) for s in systems]
-    _, _, ref = _views((systems, options, hypers), p_def=0.5)
+    _, _, ref = _views((systems, options, hypers), p_def=0.5, second_rotation=True)
     moved = [s.to(device=device) for s in systems]
-    _, _, v = _views((moved, options, hypers), p_def=0.5)
+    _, _, v = _views((moved, options, hypers), p_def=0.5, second_rotation=True)
     ho, ref_ho = v.extras["high_order"], ref.extras["high_order"]
     for f in fields(HighOrderExtras):
         value = getattr(ho, f.name)
@@ -594,3 +595,69 @@ def test_near_linear_structures_keep_their_gradient_scale(seed):
         u_proj, grad_proj = ho_views._remove_rigid_rotation(positions, u, grad)
         assert grad_proj.abs().max() <= 2 * grad.abs().max()
         assert u_proj.abs().max() <= 2 * u.abs().max()
+
+
+@pytest.mark.parametrize("p_def", [0.0, 1.0])
+def test_second_rotation_rotates_the_same_student_input(large_batch, p_def):
+    """``rot2`` is the student view (same mask, same displacement) under an extra
+    rotation per structure, and ``rotations2`` is that total rotation per atom."""
+    systems, options, off = _views(large_batch, p_def=p_def)
+    _, _, on = _views(large_batch, p_def=p_def, second_rotation=True)
+    assert set(on.extras) == {"high_order", "teacher_views", "student_views"}
+    assert not set(on.extras) & set(RESERVED_EXTRAS)
+    assert set(off.extras) == {"high_order", "teacher_views"}
+    assert off.extras["high_order"].rotations2 is None
+    # the first views and the bookkeeping do not depend on the option
+    for f in fields(HighOrderExtras):
+        if f.name != "rotations2":
+            a = getattr(off.extras["high_order"], f.name)
+            assert torch.equal(a, getattr(on.extras["high_order"], f.name)), f.name
+    for a, b in zip(off.student, on.student, strict=True):
+        assert torch.equal(a.positions, b.positions)
+
+    ho = on.extras["high_order"]
+    (second,) = on.extras["student_views"].values()
+    assert list(on.extras["student_views"]) == ["rot2"]
+    eye = torch.eye(3, dtype=ho.rotations2.dtype)
+    assert torch.allclose(ho.rotations2 @ ho.rotations2.transpose(1, 2), eye)
+    offset = 0
+    for s, first, view in zip(systems, on.student, second, strict=True):
+        n = len(s)
+        g = ho.rotations[offset : offset + n]
+        g2 = ho.rotations2[offset : offset + n]
+        # the extra rotation is one rotation per structure
+        extra = g2 @ g.transpose(1, 2)
+        assert torch.allclose(extra, extra[0].expand(n, 3, 3), atol=1e-10)
+        x = s.positions.detach() + ho.u_student[offset : offset + n]
+        assert torch.allclose(view.positions, (x[:, None] @ g2.transpose(1, 2))[:, 0])
+        assert torch.allclose(view.cell, s.cell @ g2[0].T)
+        # the same pairs (masked pairs removed), rotated
+        nl, nl2 = first.get_neighbor_list(options), view.get_neighbor_list(options)
+        assert torch.equal(nl.samples.values, nl2.samples.values)
+        torch.testing.assert_close(
+            nl2.values.reshape(-1, 3), nl.values.reshape(-1, 3) @ extra[0].T
+        )
+        offset += n
+    assert not torch.allclose(ho.rotations2, ho.rotations)
+
+
+@pytest.mark.parametrize("position_gradients", [True, False])
+def test_second_rotation_honours_position_gradients(small_batch, position_gradients):
+    _, _, v = _views(
+        small_batch, position_gradients=position_gradients, second_rotation=True
+    )
+    for system in v.extras["student_views"]["rot2"]:
+        assert system.positions.requires_grad == position_gradients
+
+
+def test_extra_student_views_are_encoded_with_gradients(
+    step_data_two_rotations, step_data
+):
+    tokens = step_data_two_rotations.extras["student_tokens"]
+    (name,) = step_data_two_rotations.extras["student_tokens_extra"]
+    extra = step_data_two_rotations.extras["student_tokens_extra"][name]
+    assert name == "rot2"
+    assert extra.node.shape == tokens.node.shape
+    assert extra.node.requires_grad and extra.edge.requires_grad
+    assert "student_tokens_extra" in RESERVED_EXTRAS
+    assert step_data.extras["student_tokens_extra"] == {}

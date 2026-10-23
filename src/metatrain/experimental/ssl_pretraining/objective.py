@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence,
 import torch
 from metatomic.torch import NeighborListOptions, System
 
-from .backbones import BACKBONES, Backbone
+from .backbones import BACKBONES, Backbone, HeadInputs
 from .masking import boundary_atoms, k_hop_ego_region, nl_ball_region
 from .views import bounded_noise, build_view, pair_vectors, random_rotations
 
@@ -88,7 +88,9 @@ class Views:
     ``in_masked_structure`` for ``gradient``; ``gradient_targets`` for
     ``gradient_spread``). ``extras`` holds builder-specific data; its key
     ``"teacher_views"`` (``Dict[str, List[System]]``) names extra teacher views,
-    encoded without gradients by :func:`encode_extra_teacher_views`.
+    encoded without gradients by :func:`encode_extra_teacher_views`, and its key
+    ``"student_views"`` (same type) extra student views, encoded with gradients by
+    :func:`encode_extra_student_views`.
     """
 
     student: List[System]
@@ -275,6 +277,31 @@ def encode_extra_teacher_views(
     return out
 
 
+def encode_extra_student_views(
+    student: torch.nn.Module,
+    extras: Dict[str, Any],
+    backbone: Backbone = BACKBONES["pet"],
+) -> Dict[str, HeadInputs]:
+    """Tokens, with gradients, of every system list in ``extras["student_views"]``.
+
+    :param student: The student core.
+    :param extras: The :attr:`Views.extras` of a view builder.
+    :param backbone: The adapter of the student backbone.
+    :return: The tokens, by view name (empty without extra views).
+    :raises ValueError: If the backbone does not expose its tokens.
+    """
+    out: Dict[str, HeadInputs] = {}
+    for name, systems in extras.get("student_views", {}).items():
+        _, tokens = backbone.forward_with_tokens(student, systems)
+        if tokens is None:
+            raise ValueError(
+                f"backbone '{backbone.name}' does not expose the tokens of the "
+                "extra student views"
+            )
+        out[name] = tokens
+    return out
+
+
 def sample_probes(
     num_probes: int, dim: int, dtype: torch.dtype, generator: torch.Generator
 ) -> torch.Tensor:
@@ -409,11 +436,18 @@ class StepData:
     # extra teacher views), "step_fraction" (training progress in [0, 1], 1 in
     # validation), "generator" (the step's random generator) and, with a view
     # builder other than Grad-JEPA's, "student_tokens" (``HeadInputs`` of the
-    # student view, with gradients)
+    # student view, with gradients), and "student_tokens_extra" (``HeadInputs`` of
+    # the extra student views, with gradients, by name)
     extras: Dict[str, Any] = field(default_factory=dict)
 
 
-RESERVED_EXTRAS = ("teacher_features", "step_fraction", "generator", "student_tokens")
+RESERVED_EXTRAS = (
+    "teacher_features",
+    "step_fraction",
+    "generator",
+    "student_tokens",
+    "student_tokens_extra",
+)
 """``StepData.extras`` keys set by the objective, not usable by view builders."""
 
 
@@ -498,6 +532,9 @@ def build_step_data(
             teacher_features = backbone.features(teacher, views.teacher)
 
     extras["teacher_features"] = encode_extra_teacher_views(teacher, extras, backbone)
+    extras["student_tokens_extra"] = encode_extra_student_views(
+        student, extras, backbone
+    )
     extras["step_fraction"] = step_fraction
     extras["generator"] = generator
 

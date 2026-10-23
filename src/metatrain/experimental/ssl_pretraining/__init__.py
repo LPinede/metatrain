@@ -1,6 +1,9 @@
 from metatrain.pet import PET
 
-from . import high_order  # noqa: F401 (registers the ``high_order`` view builder)
+from . import (
+    high_order,  # noqa: F401 (registers the ``high_order`` view builder)
+    regularizers,  # noqa: F401 (registers the ``sigreg`` term)
+)
 from .trainer import Trainer
 
 

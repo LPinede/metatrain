@@ -47,8 +47,13 @@ from metatrain.utils.hypers import init_with_defaults
 from .high_order.documentation import (
     ChiralityTermHypers,
     DeformationJetsTermHypers,
+    EquivariantVicregTermHypers,
     HighOrderHypers,
+    NonNegativeFloat,
+    PositiveFloat,
+    PositiveInt,
     ResidualMultipoleTermHypers,
+    RotationAveragedVicregTermHypers,
 )
 
 
@@ -142,6 +147,28 @@ class GradientSpreadTermHypers(TypedDict):
     (scale-free)."""
 
 
+def _odd(value: int) -> int:
+    if value < 3 or value % 2 != 1:
+        raise ValueError("must be an odd integer of at least 3")
+    return value
+
+
+class SigregTermHypers(TypedDict):
+    """``sigreg`` term: ``weight * SIGReg`` of the context student features (the
+    rows of ``vicreg``), an alternative to ``vicreg``. Random one-dimensional
+    projections of the features are pushed towards a standard normal with the
+    Epps-Pulley test (as in LeJEPA)."""
+
+    weight: NonNegativeFloat = 0.05
+    """Weight of the term."""
+    n_slices: PositiveInt = 256
+    """Number of random projection directions per step."""
+    t_max: PositiveFloat = 3.0
+    """Upper end of the integration interval of the Epps-Pulley test."""
+    n_points: Annotated[int, AfterValidator(_odd)] = 17
+    """Number of quadrature points of the Epps-Pulley test (odd)."""
+
+
 class TermsHypers(TypedDict):
     """The loss terms, by name. A term that is absent or ``null`` is disabled.
 
@@ -174,6 +201,14 @@ class TermsHypers(TypedDict):
     deformed structures."""
     chirality: NotRequired[Optional[ChiralityTermHypers]] = None
     """High-order method: chirality of the visible atoms."""
+    sigreg: NotRequired[Optional[SigregTermHypers]] = None
+    """SIGReg regularization (an alternative to ``vicreg``)."""
+    equivariant_vicreg: NotRequired[Optional[EquivariantVicregTermHypers]] = None
+    """High-order method: VICReg between two rotations of the student input, per
+    irrep block of a linear projector (needs ``high_order.second_rotation``)."""
+    vicreg_averaged: NotRequired[Optional[RotationAveragedVicregTermHypers]] = None
+    """High-order method: VICReg on the features averaged over two rotations of the
+    student input (needs ``high_order.second_rotation``)."""
 
 
 def _at_least_one_term(terms: dict) -> dict:

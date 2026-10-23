@@ -3,7 +3,15 @@
 - ``residual_multipole`` (A): the residual multipoles of the boundary atoms;
 - ``deformation_jets`` (B): the student displacement and the irreducible parts of
   the smooth-field gradient, at the atoms of deformed structures;
-- ``chirality``: the triple product of three element-channel dipoles.
+- ``chirality``: the triple product of three element-channel dipoles;
+
+and the collapse regularizers that need the second student rotation
+(``high_order.second_rotation``):
+
+- ``equivariant_vicreg``: VICReg between the back-mapped outputs of a linear
+  projector on two rotations of the same student input, per irrep block;
+- ``vicreg_averaged``: the shared VICReg on the features averaged over the two
+  rotations.
 
 Every term predicts its irrep blocks ``(l, sigma)`` with per-block heads on the
 student tokens, maps them back to the teacher frame with ``D^(l,sigma)(g_S)^T``
@@ -16,7 +24,8 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
-from ..objective import StepData
+from ..backbones import HeadInputs
+from ..objective import StepData, vicreg_terms
 from ..terms import TermContext
 from .heads import BlockHead, BlockNormalizer, batch_variance_floor
 from .irreps import XYZ_TO_L1, back_map, irrep_matrix
@@ -380,3 +389,238 @@ class ChiralityTerm(torch.nn.Module):
         loss = _block_loss(self.norm, f"{self.name}/l0", pred, target, diag)
         diag[f"{self.name}/loss"] = loss.detach()
         return self.weight * loss, diag
+
+
+AGREEMENT_EPS = 1e-8
+"""Added to the variance that normalizes the agreement (avoids 0/0 for constant
+outputs)."""
+
+VARIANCE_LEVEL = 0.5
+"""Level of the variance hinge of ``equivariant_vicreg``, on the standard deviation
+of each RMS-normalized component."""
+
+BLOCK_COVARIANCE_WEIGHT = 0.04
+"""Weight of the channel covariance relative to the agreement and the variance
+hinge in ``equivariant_vicreg``."""
+
+
+def _pooled(x: HeadInputs) -> torch.Tensor:
+    """The pooled per-atom feature: node tokens and the cutoff-weighted edge-token
+    sum (equal to the backbone's per-atom ``"feature"`` output)."""
+    return torch.cat([x.node, (x.edge * x.cutoff[..., None]).sum(1)], dim=-1)
+
+
+def _second_rotation_tokens(step: StepData, name: str) -> HeadInputs:
+    """The tokens of the second student rotation, or a clear error without it."""
+    tokens = step.extras.get("student_tokens_extra", {})
+    if "rot2" not in tokens:
+        raise ValueError(f"the '{name}' term needs `high_order.second_rotation`")
+    return tokens["rot2"]
+
+
+def equivariant_vicreg_block(
+    z1: torch.Tensor, z2: torch.Tensor, var_level: float = VARIANCE_LEVEL
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Agreement, variance hinge and channel covariance of one block of back-mapped
+    outputs of two rotations, ``(n, 2l+1, channels)`` each.
+
+    - agreement: ``mean |z1 - z2|^2`` over the atoms, divided by ``(2l+1)`` times
+      the mean per-component variance of the two views; 2 for outputs that ignore
+      the orientation (two independent random back-maps), 0 for equivariant ones;
+    - variance hinge: both views are divided by one scalar, their joint RMS, then
+      ``relu(var_level - std)`` of each component over the atoms (scale-free);
+    - covariance: the squared off-diagonal of the channel Gram matrix of the
+      centred, normalized outputs, contracted over the atoms and the ``2l+1``
+      components (invariant under a rotation shared by all atoms), over channels.
+
+    The hinge and the covariance are averaged over the two views.
+
+    .. code-block:: python
+
+        agreement, hinge, covariance = equivariant_vicreg_block(z1, z2)
+
+    :param z1: Back-mapped outputs of the first rotation.
+    :param z2: Back-mapped outputs of the second rotation.
+    :param var_level: Level of the variance hinge.
+    :return: The three scalars (zero, in the graph, for fewer than two atoms).
+    """
+    if z1.shape[0] < 2:
+        zero = (z1.sum() + z2.sum()) * 0.0
+        return zero, zero, zero
+    n, m, c = z1.shape
+    variance = 0.5 * (
+        z1.var(0, unbiased=False).mean() + z2.var(0, unbiased=False).mean()
+    )
+    agreement = ((z1 - z2) ** 2).sum(1).mean() / (m * variance + AGREEMENT_EPS)
+    scale = (0.5 * (z1.pow(2).mean() + z2.pow(2).mean())).sqrt() + AGREEMENT_EPS
+    hinge, covariance = z1.new_zeros(()), z1.new_zeros(())
+    for z in (z1 / scale, z2 / scale):
+        hinge = hinge + torch.relu(var_level - z.std(0)).mean()
+        centered = z - z.mean(0)
+        gram = torch.einsum("nmc,nmd->cd", centered, centered) / (n * m)
+        off_diagonal = gram - torch.diag(torch.diagonal(gram))
+        covariance = covariance + off_diagonal.pow(2).sum() / c
+    return agreement, 0.5 * hinge, 0.5 * covariance
+
+
+class EquivariantVicregTerm(torch.nn.Module):
+    """VICReg between two rotations of the same student input, per irrep block.
+
+    For every block ``(l, sigma)``, ``1 <= l <= l_max`` (both parities with
+    ``rotation_group="O3"``), a linear map of the pooled student feature of each
+    view is mapped back to the teacher frame with its own rotation (``g_S`` and
+    ``g2 g_S``), over the visible atoms. The loss is ``weight * ramp *`` the mean
+    over the blocks of ``agreement + hinge + 0.04 covariance``
+    (:func:`equivariant_vicreg_block`). The projector is linear so that it cannot
+    create angular orders: the criterion is met only by order-l content of the
+    backbone features. Order 0 is left to the shared anti-collapse term.
+
+    .. code-block:: python
+
+        term = EquivariantVicregTerm(dims=(256, 256), l_max=2, channels=16)
+        loss, diagnostics = term(step)
+
+    :param dims: ``(Dn, De)`` token dimensions.
+    :param l_max: Highest order of the blocks.
+    :param channels: Number of channels of each block.
+    :param weight: Weight of the term.
+    :param rotation_group: ``"O3"`` (proper and pseudo blocks) or ``"SO3"``
+        (proper blocks only).
+    :param warmup_fraction: Off for this fraction of the steps, then ramped
+        linearly to ``weight`` over the same fraction.
+    """
+
+    name = "equivariant_vicreg"
+    needs_gradients = False
+    uses_prediction = False
+
+    def __init__(
+        self,
+        dims: Tuple[int, int],
+        l_max: int = 2,
+        channels: int = 16,
+        weight: float = 0.1,
+        rotation_group: str = "O3",
+        warmup_fraction: float = 0.05,
+    ) -> None:
+        super().__init__()
+        if rotation_group not in ("O3", "SO3"):
+            raise ValueError(f"unknown rotation group '{rotation_group}'")
+        self.weight, self.warmup_fraction, self.channels = (
+            weight,
+            warmup_fraction,
+            channels,
+        )
+        self.required_targets: dict = {}
+        sigmas = (1, -1) if rotation_group == "O3" else (1,)
+        self.blocks = [(l, sigma) for l in range(1, l_max + 1) for sigma in sigmas]
+        self.proj = torch.nn.ModuleDict(
+            {
+                self._key(l, sigma): torch.nn.Linear(
+                    dims[0] + dims[1], (2 * l + 1) * channels
+                )
+                for l, sigma in self.blocks
+            }
+        )
+
+    @staticmethod
+    def _key(l: int, sigma: int) -> str:
+        return f"l{l}{'p' if sigma == 1 else 'm'}"
+
+    @classmethod
+    def from_hypers(
+        cls, hypers: Dict[str, Any], context: TermContext
+    ) -> "EquivariantVicregTerm":
+        """Build the term from its hypers and the run's context."""
+        return cls(dims=context.dims, **hypers)
+
+    def ramp(self, step_fraction: float) -> float:
+        """The schedule factor: 0 during the warm-up, then linear to 1 over the
+        next ``warmup_fraction`` of the steps."""
+        w = self.warmup_fraction
+        if w == 0:
+            return 1.0
+        return float(min(max((step_fraction - w) / w, 0.0), 1.0))
+
+    def back_mapped(
+        self, step: StepData, l: int, sigma: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The projected block of both views at the visible atoms, mapped back to
+        the teacher frame, ``(n_visible, 2l+1, channels)`` each."""
+        ho: HighOrderExtras = step.extras["high_order"]
+        visible = ~step.views.masked
+        second = _second_rotation_tokens(step, self.name)
+        assert ho.rotations2 is not None
+        proj = self.proj[self._key(l, sigma)]
+        out = []
+        for tokens, rotations in (
+            (step.extras["student_tokens"], ho.rotations),
+            (second, ho.rotations2),
+        ):
+            p = proj(_pooled(tokens.select(visible)))
+            p = p.reshape(-1, 2 * l + 1, self.channels)
+            out.append(back_map(p, irrep_matrix(rotations[visible], l, sigma)))
+        return out[0], out[1]
+
+    def forward(self, step: StepData) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        diag: Dict[str, torch.Tensor] = {}
+        losses = []
+        for l, sigma in self.blocks:
+            key = f"{self.name}/{self._key(l, sigma)}"
+            agreement, hinge, covariance = equivariant_vicreg_block(
+                *self.back_mapped(step, l, sigma)
+            )
+            losses.append(agreement + hinge + BLOCK_COVARIANCE_WEIGHT * covariance)
+            diag[f"{key}/agreement"] = agreement.detach()
+            diag[f"{key}/variance"] = hinge.detach()
+            diag[f"{key}/covariance"] = covariance.detach()
+        loss = torch.stack(losses).mean()
+        ramp = self.ramp(step.extras["step_fraction"])
+        diag[f"{self.name}/loss"] = loss.detach()
+        diag[f"{self.name}/ramp"] = loss.new_tensor(ramp)
+        return self.weight * ramp * loss, diag
+
+
+def vicreg_on_average(
+    f1: torch.Tensor, f2: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The shared VICReg terms of the features averaged over two views."""
+    return vicreg_terms(0.5 * (f1 + f2))
+
+
+class RotationAveragedVicregTerm:
+    """``variance * L_var + covariance * L_cov`` of the student features averaged
+    over two rotations of the same student input, at the rows of ``vicreg``.
+
+    Averaging halves, in expectation, the variance that features can get from the
+    orientation of the input alone, so VICReg must find more of its variance in
+    the structures.
+
+    .. code-block:: python
+
+        term = RotationAveragedVicregTerm(variance=1.0, covariance=0.04)
+        loss, diagnostics = term(step)
+
+    :param variance: Weight of the variance hinge.
+    :param covariance: Weight of the covariance penalty.
+    """
+
+    name = "vicreg_averaged"
+    needs_gradients = False
+    uses_prediction = False
+
+    def __init__(self, variance: float = 1.0, covariance: float = 0.04) -> None:
+        self.variance, self.covariance = variance, covariance
+        self.required_targets: dict = {}
+
+    def __call__(self, step: StepData) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        rows = ~step.views.masked
+        second = _second_rotation_tokens(step, self.name)
+        f1 = _pooled(step.extras["student_tokens"].select(rows))
+        f2 = _pooled(second.select(rows))
+        variance, covariance = vicreg_on_average(f1, f2)
+        loss = self.variance * variance + self.covariance * covariance
+        return loss, {
+            f"{self.name}/variance": variance.detach(),
+            f"{self.name}/covariance": covariance.detach(),
+        }

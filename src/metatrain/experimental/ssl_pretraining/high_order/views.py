@@ -12,6 +12,10 @@
   ``plus`` view and ``extras["teacher_views"]`` holds ``minus`` (``teacher_pair``),
   or ``Views.teacher`` is the clean ``x0`` and ``extras["teacher_views"]`` holds
   ``plus`` (one-sided fallback).
+- **Second rotation** (``high_order.second_rotation``): the same student input
+  (same mask, same displacement) under an extra random rotation ``g2`` per
+  structure, in ``extras["student_views"]["rot2"]``. Its rotations are drawn after
+  every other random number, so the other views do not depend on the option.
 
 Displacements are bounded by ``noise.skin / 2`` per atom, separately for ``u_S`` and
 ``u_T``, so the skin neighbor list stays exact: ``u_T`` is capped per atom, and
@@ -22,7 +26,7 @@ of the positions.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from metatomic.torch import NeighborListOptions, System
@@ -71,6 +75,9 @@ class HighOrderExtras:
     structure_index: torch.Tensor  # (n_atoms,) structure of each atom
     student_pairs: torch.Tensor  # (n_student_pairs, 2) kept student pairs < cutoff
     student_distances: torch.Tensor  # (n_student_pairs,) their student distances
+    # (n_atoms, 3, 3) total rotation g2 g_S of the second student view of each
+    # atom, with ``high_order.second_rotation`` (else None)
+    rotations2: Optional[torch.Tensor] = None
 
 
 def _min_image(
@@ -263,8 +270,9 @@ def build_high_order_views(
     :param generator: CPU random generator driving all sampling.
     :param position_gradients: Whether the student and teacher positions require
         grad.
-    :return: The views, with ``extras["high_order"]`` (:class:`HighOrderExtras`)
-        and ``extras["teacher_views"]``.
+    :return: The views, with ``extras["high_order"]`` (:class:`HighOrderExtras`),
+        ``extras["teacher_views"]`` and, with ``high_order.second_rotation``,
+        ``extras["student_views"]``.
     :raises ValueError: If an atomic type is missing from ``atomic_types``.
     """
     dtype = systems[0].positions.dtype
@@ -277,6 +285,9 @@ def build_high_order_views(
     )
 
     student: List[System] = []
+    # per structure: the displaced positions, cell and kept pairs of the student
+    # view, before its rotation (for the second rotation)
+    student_inputs: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     teacher: List[System] = []
     extra_teacher: List[System] = []
     per_structure: Dict[str, List[torch.Tensor]] = {}
@@ -360,6 +371,7 @@ def build_high_order_views(
             keep_pairs=keep,
         )
         student.append(student_view)
+        student_inputs.append((positions + u_student, cell, keep))
         student_nl = student_view.get_neighbor_list(options)
         student_distances = student_nl.values.reshape(-1, 3).norm(dim=-1).detach()
         student_close = student_distances < cutoff
@@ -457,11 +469,35 @@ def build_high_order_views(
         **out,
     )
     teacher_views = {"minus" if ho["teacher_pair"] else "plus": extra_teacher}
+    view_extras: Dict[str, Any] = {"high_order": extras, "teacher_views": teacher_views}
+    if ho["second_rotation"]:
+        # drawn last: the other views do not depend on the option
+        extra_rotations = random_rotations(
+            len(systems), hypers["rotation_group"], dtype, generator
+        ).to(device)
+        second: List[System] = []
+        rotations2 = []
+        for index, (system, (x, cell, keep)) in enumerate(
+            zip(systems, student_inputs, strict=True)
+        ):
+            rotation = extra_rotations[index] @ rotations[index].to(device)
+            second.append(
+                build_view(
+                    system,
+                    options,
+                    (x @ rotation.T).requires_grad_(position_gradients),
+                    cell @ rotation.T,
+                    keep_pairs=keep,
+                )
+            )
+            rotations2.append(rotation.expand(len(system), 3, 3))
+        extras.rotations2 = torch.cat(rotations2)
+        view_extras["student_views"] = {"rot2": second}
     return Views(
         student=student,
         teacher=teacher,
         rotations=extras.rotations,
         masked=masked,
         latent_targets=latent_targets,
-        extras={"high_order": extras, "teacher_views": teacher_views},
+        extras=view_extras,
     )

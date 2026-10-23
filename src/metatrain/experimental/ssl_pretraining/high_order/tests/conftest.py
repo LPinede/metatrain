@@ -88,6 +88,14 @@ def step_data_deformed(medium_batch, pet_core, small_teacher):
 
 
 @pytest.fixture
+def step_data_two_rotations(medium_batch, pet_core, small_teacher):
+    """High-order step data of ``medium_batch`` with the second student rotation."""
+    return make_step(
+        medium_batch, pet_core, small_teacher, seed=1, second_rotation=True
+    )
+
+
+@pytest.fixture
 def tiny_step_data(tiny_batch, pet_core, small_teacher):
     """High-order step data of two dimers (no boundary atom, no centre)."""
     return make_step(tiny_batch, pet_core, small_teacher, seed=0)
