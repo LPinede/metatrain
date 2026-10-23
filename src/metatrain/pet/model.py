@@ -68,6 +68,10 @@ class PET(ModelInterface[ModelHypers]):
     key_labels: Dict[str, Labels]
     property_labels: Dict[str, List[Labels]]
     component_labels: Dict[str, List[List[Labels]]]
+    # class-level annotations let TorchScript type these containers even when they
+    # are empty (models without targets, e.g. self-supervised pretraining)
+    output_shapes: Dict[str, Dict[str, List[int]]]
+    target_names: List[str]
 
     def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
         super().__init__(hypers, dataset_info, self.__default_metadata__)
