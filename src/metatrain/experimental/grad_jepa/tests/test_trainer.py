@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from metatrain.experimental.grad_jepa import objective
+from metatrain.experimental.grad_jepa import trainer as trainer_module
 from metatrain.experimental.grad_jepa.documentation import TrainerHypers
 from metatrain.experimental.grad_jepa.trainer import (
     Trainer,
@@ -217,3 +218,93 @@ def test_train_latent_only(tmp_path, monkeypatch):
     )
     assert trainer.epoch == 0
     assert (tmp_path / "model_0.ckpt").exists()
+
+
+def _labels_devices(module: torch.nn.Module) -> set:
+    """Devices of the metatensor buffers (e.g. PET's ``single_label``) of a module."""
+    devices = set()
+    for submodule in module.modules():
+        for name in getattr(submodule, "_mts_buffer_names", []):
+            value = getattr(submodule, name)
+            if hasattr(value, "device"):
+                devices.add(torch.device(value.device).type)
+    return devices
+
+
+def _train_then_restart(tmp_path, device: torch.device) -> None:
+    """A fresh 1-epoch run, then a ``restart_from`` run for one more epoch."""
+    torch.manual_seed(0)
+    dataset = _dataset()
+    trainer = Trainer(_trainer_hypers(num_epochs=1))
+    model = trainer.setup(small_model_hypers(), INFO)
+    trainer.train(model, torch.float32, [device], [dataset], [dataset], str(tmp_path))
+    path = tmp_path / "ssl.ckpt"
+    trainer.save_checkpoint(model, path)
+    resumed = Trainer(_trainer_hypers(num_epochs=2, restart_from=str(path)))
+    resumed_model = resumed.setup(small_model_hypers(), INFO)
+    resumed.train(
+        resumed_model, torch.float32, [device], [dataset], [dataset], str(tmp_path)
+    )
+
+
+def test_modules_are_moved_after_copies_and_loads(tmp_path, monkeypatch):
+    """CPU check of the device bug fixed for GPUs.
+
+    ``copy.deepcopy`` and ``load_state_dict`` leave metatensor Labels buffers on the
+    CPU, whatever the device of the module. A device move (``_apply``) must therefore
+    come after the teacher is copied and after every state load, for both the
+    student and the teacher. On a CPU-only machine the devices cannot differ, so the
+    order of these events is recorded and checked instead.
+    """
+    from metatrain.pet import PET
+
+    moved: dict = {}  # id(PET) -> True if moved since its last copy or load
+    original_deepcopy = copy.deepcopy
+    original_apply = PET._apply
+    original_load = PET._load_from_state_dict
+
+    def deepcopy(value, *args, **kwargs):
+        result = original_deepcopy(value, *args, **kwargs)
+        if isinstance(result, PET):
+            moved[id(result)] = False
+        return result
+
+    def apply(self, *args, **kwargs):
+        result = original_apply(self, *args, **kwargs)
+        moved[id(self)] = True
+        return result
+
+    def load(self, *args, **kwargs):
+        moved[id(self)] = False
+        return original_load(self, *args, **kwargs)
+
+    seen = []
+    loss_function = trainer_module.grad_jepa_loss
+
+    def spy(student, teacher, *args, **kwargs):
+        seen.append((moved.get(id(student), False), moved.get(id(teacher), False)))
+        return loss_function(student, teacher, *args, **kwargs)
+
+    monkeypatch.setattr(copy, "deepcopy", deepcopy)
+    monkeypatch.setattr(PET, "_apply", apply)
+    monkeypatch.setattr(PET, "_load_from_state_dict", load)
+    monkeypatch.setattr(trainer_module, "grad_jepa_loss", spy)
+    _train_then_restart(tmp_path, torch.device("cpu"))
+    assert len(seen) > 0
+    assert all(student and teacher for student, teacher in seen)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs an MPS device")
+def test_train_and_restart_on_mps(tmp_path, monkeypatch):
+    """Every metatensor buffer of the student and teacher is on the device."""
+    seen = []
+    loss_function = trainer_module.grad_jepa_loss
+
+    def spy(student, teacher, *args, **kwargs):
+        seen.append(_labels_devices(student) | _labels_devices(teacher))
+        return loss_function(student, teacher, *args, **kwargs)
+
+    monkeypatch.setattr(trainer_module, "grad_jepa_loss", spy)
+    _train_then_restart(tmp_path, torch.device("mps"))
+    assert len(seen) > 0
+    assert all(devices == {"mps"} for devices in seen)

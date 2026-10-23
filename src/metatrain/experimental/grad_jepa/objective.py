@@ -307,7 +307,8 @@ def relative_gradient_spread(
 
 def rankme(features: torch.Tensor) -> torch.Tensor:
     """RankMe effective rank (exp of the spectral entropy) of the rows."""
-    singular = torch.linalg.svdvals(features.detach().double())
+    # computed in float64 on the CPU, since MPS has no float64
+    singular = torch.linalg.svdvals(features.detach().cpu().double())
     p = singular / (singular.sum() + 1e-12) + 1e-12
     return torch.exp(-(p * torch.log(p)).sum())
 
@@ -474,7 +475,7 @@ def grad_jepa_loss(
         loss = loss + term_loss
 
     context = ~step.views.masked
-    metrics["masked_fraction"] = step.views.masked.double().mean()
+    metrics["masked_fraction"] = step.views.masked.cpu().double().mean()
     if with_rank:
         metrics["rankme"] = rankme(step.student_features[context][:4096])
     return loss, {name: float(value.detach()) for name, value in metrics.items()}

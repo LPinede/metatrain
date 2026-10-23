@@ -109,7 +109,16 @@ class Trainer(TrainerInterface):
         hypers = self.hypers
 
         student = model.core
+        if hypers["restart_from"] is not None:
+            self._load_restart_state(hypers["restart_from"], model)
+        # ``copy.deepcopy`` and ``load_state_dict`` leave metatensor Labels buffers
+        # (PET's ``single_label``) on the CPU: build and restore the teacher first,
+        # then move everything to the device
+        teacher = copy.deepcopy(student)
+        if self.teacher_state_dict is not None:
+            teacher.load_state_dict(self.teacher_state_dict)
         model.to(device=device, dtype=dtype)
+        teacher.to(device=device, dtype=dtype)
         options = student.requested_neighbor_lists()[0]
         check_hypers(hypers, options.cutoff)
         terms = build_terms(hypers["objective"]["terms"])
@@ -126,15 +135,10 @@ class Trainer(TrainerInterface):
             num_layers=hypers["predictor"]["num_layers"],
             conditioners=build_conditioners(hypers["predictor"]["conditioners"]),
         ).to(device=device, dtype=dtype)
-        teacher = copy.deepcopy(student)
         teacher.eval()
         for parameter in teacher.parameters():
             parameter.requires_grad_(False)
 
-        if hypers["restart_from"] is not None:
-            self._load_restart_state(hypers["restart_from"], model)
-        if self.teacher_state_dict is not None:
-            teacher.load_state_dict(self.teacher_state_dict)
         if self.predictor_state_dict is not None:
             predictor.load_state_dict(self.predictor_state_dict)
 
