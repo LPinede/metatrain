@@ -171,9 +171,28 @@ class ObjectiveHypers(TypedDict):
     """The active loss terms and their hypers."""
 
 
+class ConditionersHypers(TypedDict):
+    """The predictor conditioners, by name (none are registered in v1). A conditioner
+    that is absent or ``null`` is disabled. Each registered conditioner has an
+    optional ``NotRequired[Optional[...]]`` entry here, as the loss terms do in
+    ``TermsHypers``, so that unknown names and misspelled keys are rejected."""
+
+
+def _at_least_one_layer(num_layers: int) -> int:
+    if num_layers < 1:
+        raise ValueError("`predictor.num_layers` must be at least 1")
+    return num_layers
+
+
 class PredictorHypers(TypedDict):
     """Hyperparameters of the predictor."""
 
+    num_layers: Annotated[int, AfterValidator(_at_least_one_layer)] = 1
+    """Number of predictor layers. The first ``num_layers - 1`` are residual
+    message-passing updates among the context atoms; the last one is the readout at
+    the target atoms. The default, 1, is a single readout layer."""
+    conditioners: ConditionersHypers = init_with_defaults(ConditionersHypers)
+    """Extra edge inputs of the predictor, by name and with their hypers."""
     hidden_dim: int = 128
     """Width of the predictor messages."""
     probe_dim: int = 32

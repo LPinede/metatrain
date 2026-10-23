@@ -396,8 +396,18 @@ def build_step_data(
             )
 
     types = torch.cat([s.types for s in systems])
+    step = StepData(
+        views=views,
+        probes=probes,
+        student_features=student_features,
+        teacher_features=teacher_features.detach(),
+        student_gradients=student_gradients,
+        teacher_gradients=teacher_gradients,
+        prediction={},  # set below: the conditioners read the rest of the step
+        hypers=hypers,
+    )
     with torch.set_grad_enabled(student.training):
-        prediction = predictor(
+        step.prediction = predictor(
             student_features,
             student_gradients,
             probes,
@@ -406,18 +416,9 @@ def build_step_data(
             views.masked,
             views.pairs,
             views.vectors,
+            step,
         )
-
-    return StepData(
-        views=views,
-        probes=probes,
-        student_features=student_features,
-        teacher_features=teacher_features.detach(),
-        student_gradients=student_gradients,
-        teacher_gradients=teacher_gradients,
-        prediction=prediction,
-        hypers=hypers,
-    )
+    return step
 
 
 def grad_jepa_loss(

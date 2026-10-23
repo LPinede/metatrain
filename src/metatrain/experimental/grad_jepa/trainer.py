@@ -29,6 +29,7 @@ from metatrain.utils.logging import ROOT_LOGGER, MetricLogger
 from metatrain.utils.transfer import batch_to
 from metatrain.utils.wrapper import MetatrainModel
 
+from .conditioners import build_conditioners
 from .objective import grad_jepa_loss
 from .predictor import GradJEPAPredictor
 from .terms import build_terms
@@ -122,6 +123,8 @@ class Trainer(TrainerInterface):
             cutoff=options.cutoff,
             atomic_types=model.dataset_info.atomic_types,
             species_query=hypers["predictor"]["species_query"],
+            num_layers=hypers["predictor"]["num_layers"],
+            conditioners=build_conditioners(hypers["predictor"]["conditioners"]),
         ).to(device=device, dtype=dtype)
         teacher = copy.deepcopy(student)
         teacher.eval()
