@@ -472,3 +472,5 @@ def check_hypers(hypers: Dict[str, Any], cutoff: float) -> None:
         raise ValueError("`num_probes` must be at least 1")
     if hypers["noise"]["probability"] > 0 and hypers["noise"]["skin"] <= 0:
         raise ValueError("`noise.skin` must be positive when noise is enabled")
+    if hypers["views"]["builder"] == "high_order" and hypers["noise"]["skin"] <= 0:
+        raise ValueError("`noise.skin` must be positive with the high_order views")

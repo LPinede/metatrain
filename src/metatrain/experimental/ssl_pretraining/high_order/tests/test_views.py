@@ -3,6 +3,7 @@ from dataclasses import fields
 
 import pytest
 import torch
+from metatomic.torch import System
 
 from metatrain.experimental.ssl_pretraining.high_order import views as ho_views
 from metatrain.experimental.ssl_pretraining.high_order.deformations import (
@@ -399,3 +400,107 @@ def test_views_follow_the_device(large_batch, device):
         for s, r in zip(getattr(v, name), getattr(ref, name), strict=True):
             assert s.positions.device.type == device.type
             torch.testing.assert_close(s.positions.detach().cpu(), r.positions)
+
+
+def test_student_displacement_is_smooth_plus_bounded_iid():
+    """``u_S = u_smooth + iid`` exactly, with the iid part centred and capped and the
+    smooth part scaled as a whole (never capped per atom)."""
+    generator = torch.Generator().manual_seed(0)
+    field = 0.4 * torch.randn(30, 3, dtype=torch.float64, generator=generator)
+    gradient = torch.randn(30, 3, 3, dtype=torch.float64, generator=generator)
+    iid = 0.05 * torch.randn(30, 3, dtype=torch.float64, generator=generator)
+    max_norm, sigma = 0.25, 0.05
+    u_smooth, grad_smooth, u_student = ho_views._student_displacement(
+        field, gradient, iid, sigma, max_norm
+    )
+    bound = min(3 * sigma, max_norm / 2)
+    expected_iid = ho_views.cap_norm(iid - iid.mean(0), bound)
+    assert torch.equal(u_student, u_smooth + expected_iid)
+    smooth = field - field.mean(0)
+    scale = (max_norm - bound) / smooth.norm(dim=-1).max()
+    assert scale < 1  # the bound acts on this field
+    torch.testing.assert_close(u_smooth, scale * smooth)
+    torch.testing.assert_close(grad_smooth, scale * gradient)
+    assert u_student.norm(dim=-1).max() <= max_norm + 1e-12
+    # a small field is left unscaled
+    u_small, g_small, _ = ho_views._student_displacement(
+        0.01 * field, gradient, iid, sigma, max_norm
+    )
+    torch.testing.assert_close(u_small, 0.01 * smooth)
+    assert torch.equal(g_small, gradient)
+
+
+def test_deformed_views_split_smooth_and_iid(large_batch):
+    _, _, v = _views(large_batch, p_def=1.0, iid_sigma=0.0)
+    ho = v.extras["high_order"]
+    assert torch.equal(ho.u_student, ho.u_smooth)
+    _, _, v = _views(large_batch, p_def=1.0)
+    ho = v.extras["high_order"]
+    hypers = large_batch[2]
+    max_norm = hypers["noise"]["skin"] / 2
+    bound = min(3 * hypers["high_order"]["iid_sigma"], max_norm / 2)
+    assert (ho.u_student - ho.u_smooth).norm(dim=-1).max() <= bound + 1e-12
+    assert ho.u_student.norm(dim=-1).max() <= max_norm + 1e-12
+
+
+@pytest.mark.parametrize("periodic", [False, True])
+def test_grad_smooth_is_the_gradient_of_u_smooth(large_batch, monkeypatch, periodic):
+    """Finite differences of the stored (scaled) smooth field, regenerated from the
+    same random state, match ``grad_smooth`` at every atom."""
+    name = "periodic_field_with_gradient" if periodic else "smooth_field_with_gradient"
+    original = getattr(ho_views, name)
+    recorded = []
+
+    def spy(positions, *args):
+        recorded.append((positions.clone(), args[:-1], args[-1].get_state()))
+        return original(positions, *args)
+
+    monkeypatch.setattr(ho_views, name, spy)
+    systems, _, v = _views(large_batch, p_def=1.0)
+    ho = v.extras["high_order"]
+    ((positions, args, state),) = recorded
+    atoms = ho.structure_index == (1 if periodic else 0)
+
+    def field(x):
+        generator = torch.Generator()
+        generator.set_state(state)
+        return original(x, *args, generator)
+
+    u0, _ = field(positions)
+    scale = ho.u_smooth[atoms].norm() / (u0 - u0.mean(0)).norm()
+    torch.testing.assert_close(ho.u_smooth[atoms], scale * (u0 - u0.mean(0)))
+    h = 1e-5
+    numeric = torch.zeros(len(positions), 3, 3, dtype=torch.float64)
+    for b in range(3):
+        e = torch.zeros(3, dtype=torch.float64)
+        e[b] = h
+        # every atom moves: the subtracted mean moves too
+        up, um = field(positions + e)[0], field(positions - e)[0]
+        numeric[:, :, b] = scale * (up - um) / (2 * h)
+    grad = ho.grad_smooth[atoms]
+    torch.testing.assert_close(numeric, grad - grad.mean(0), atol=1e-7, rtol=1e-6)
+
+
+def test_partially_periodic_zero_cell_rows_raise(small_batch):
+    systems, options, hypers = small_batch
+    s = systems[0]
+    pbc = torch.tensor([True, True, False])
+    cell = torch.diag(torch.tensor([10.0, 10.0, 0.0]))
+    broken = System(positions=s.positions, types=s.types, cell=cell, pbc=pbc)
+    broken.add_neighbor_list(options, s.get_neighbor_list(options))
+    with pytest.raises(ValueError, match="non-zero cell vectors"):
+        build_high_order_views(
+            [broken], options, hypers, torch.Generator().manual_seed(0), True
+        )
+
+
+def test_check_hypers_requires_a_skin():
+    from metatrain.experimental.ssl_pretraining.trainer import check_hypers
+    from metatrain.utils.architectures import get_default_hypers
+
+    hypers = get_default_hypers("experimental.ssl_pretraining")["training"]
+    hypers["views"]["builder"] = "high_order"
+    hypers["noise"]["probability"] = 0.0
+    hypers["noise"]["skin"] = 0.0
+    with pytest.raises(ValueError, match="high_order"):
+        check_hypers(hypers, cutoff=4.0)

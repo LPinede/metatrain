@@ -11,13 +11,16 @@
   or ``Views.teacher`` is the clean ``x0`` and ``extras["teacher_views"]`` holds
   ``plus`` (one-sided fallback).
 
-Displacements are capped at ``noise.skin / 2`` per atom, separately for ``u_S`` and
-``u_T``, so the skin neighbor list stays exact. All random numbers are drawn on CPU
-from the step generator, then moved to the device and dtype of the positions.
+Displacements are bounded by ``noise.skin / 2`` per atom, separately for ``u_S`` and
+``u_T``, so the skin neighbor list stays exact: ``u_T`` is capped per atom, and
+``u_S`` is bounded by scaling its smooth part per structure and capping its iid
+part (so that ``grad_smooth`` stays the exact gradient of ``u_smooth``). All random
+numbers are drawn on CPU from the step generator, then moved to the device and dtype
+of the positions.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import torch
 from metatomic.torch import NeighborListOptions, System
@@ -52,7 +55,7 @@ class HighOrderExtras:
     rotations: torch.Tensor  # (n_atoms, 3, 3) student rotation of each atom
     u_student: torch.Tensor  # (n_atoms, 3) total student displacement u_S
     grad_smooth: torch.Tensor  # (n_atoms, 3, 3) d(u_smooth)_a / dx_b at each atom
-    u_smooth: torch.Tensor  # (n_atoms, 3) smooth part of u_S (before the cap)
+    u_smooth: torch.Tensor  # (n_atoms, 3) smooth part of u_S (u_S - u_smooth: iid)
     pair_index: torch.Tensor  # (n_pairs, 2) clean pairs within the cutoff
     clean_vectors: torch.Tensor  # (n_pairs, 3) clean pair vectors
     observed_vectors: torch.Tensor  # (n_pairs, 3) clean + u_S[j] - u_S[i]
@@ -73,6 +76,10 @@ def _min_image(
 ) -> torch.Tensor:
     """Minimum-image convention for ``vectors`` along the periodic directions.
 
+    Rounding the fractional coordinates gives the nearest image for orthogonal and
+    mildly skewed cells; for strongly skewed cells it is an approximation (a
+    shorter image may exist).
+
     :param vectors: Vectors, shape ``(n, 3)``.
     :param cell: Cell matrix (rows are lattice vectors), full rank if periodic.
     :param pbc: Periodicity of each lattice direction, shape ``(3,)``.
@@ -83,6 +90,38 @@ def _min_image(
     frac = vectors @ torch.linalg.inv(cell)
     frac = torch.where(pbc, frac - torch.round(frac), frac)
     return frac @ cell
+
+
+def _student_displacement(
+    field: torch.Tensor,
+    gradient: torch.Tensor,
+    iid: torch.Tensor,
+    iid_sigma: float,
+    max_norm: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bounded student displacement ``u_S = u_smooth + iid``, with ``|u_S| <=
+    max_norm`` at every atom and ``grad_smooth`` the exact gradient of ``u_smooth``.
+
+    The iid part is centred and capped per atom at ``b = min(3 iid_sigma,
+    max_norm / 2)``; the centred smooth field (and its gradient) is scaled by a
+    single factor per structure so that its largest norm is at most
+    ``max_norm - b``. No per-atom cap acts on the smooth part, so it stays a smooth
+    field with a known gradient.
+
+    :param field: Smooth field, shape ``(n_atoms, 3)``.
+    :param gradient: Its gradient, shape ``(n_atoms, 3, 3)``.
+    :param iid: Raw iid noise, shape ``(n_atoms, 3)``.
+    :param iid_sigma: Standard deviation of the iid noise.
+    :param max_norm: Maximum displacement norm per atom (``skin / 2``).
+    :return: ``u_smooth``, ``grad_smooth`` and ``u_student``.
+    """
+    bound = min(3 * iid_sigma, max_norm / 2)
+    iid = cap_norm(iid - iid.mean(dim=0), bound)
+    smooth = field - field.mean(dim=0)
+    largest = smooth.norm(dim=-1).max().clamp(min=1e-12)
+    scale = torch.clamp((max_norm - bound) / largest, max=1.0)
+    u_smooth = scale * smooth
+    return u_smooth, scale * gradient, u_smooth + iid
 
 
 def _select_centers(
@@ -199,6 +238,11 @@ def build_high_order_views(
         n_atoms = len(system)
         positions = system.positions.detach()
         cell = system.cell.detach()
+        if bool(system.pbc.any()) and bool((cell.norm(dim=-1) == 0).any()):
+            raise ValueError(
+                "periodic systems need three non-zero cell vectors (partially "
+                "periodic systems with zero cell rows are not supported)"
+            )
         samples = system.get_neighbor_list(options).samples.values
         clean_vectors = pair_vectors(positions, cell, samples)
         distances = clean_vectors.norm(dim=-1)
@@ -211,7 +255,7 @@ def build_high_order_views(
         if deformed:
             masked = torch.zeros(n_atoms, dtype=torch.bool)
             if bool(system.pbc.any()):
-                u_smooth, grad_smooth = periodic_field_with_gradient(
+                field = periodic_field_with_gradient(
                     positions,
                     cell,
                     ho["field_amplitude"],
@@ -219,7 +263,7 @@ def build_high_order_views(
                     generator,
                 )
             else:
-                u_smooth, grad_smooth = smooth_field_with_gradient(
+                field = smooth_field_with_gradient(
                     positions,
                     ho["field_amplitude"],
                     ho["wavelength"],
@@ -229,8 +273,13 @@ def build_high_order_views(
             iid = ho["iid_sigma"] * torch.randn(
                 n_atoms, 3, generator=generator, dtype=torch.float64
             )
-            u_student = u_smooth + iid.to(device=device, dtype=dtype)
-            u_student = cap_norm(u_student - u_student.mean(dim=0), max_norm)
+            u_smooth, grad_smooth, u_student = _student_displacement(
+                field[0],
+                field[1],
+                iid.to(device=device, dtype=dtype),
+                ho["iid_sigma"],
+                max_norm,
+            )
         else:
             # region sampling loops over atoms: run it on CPU
             masked = sample_mask(
