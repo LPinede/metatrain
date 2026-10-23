@@ -146,6 +146,7 @@ ignore = ["B018", "B904"]
 
 [tool.ruff.lint.per-file-ignores]
 "**/{docs,deprecated,examples,experimental,tests}/*" = ["D"]
+"src/metatrain/experimental/ssl_pretraining/high_order/**" = ["E741"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
