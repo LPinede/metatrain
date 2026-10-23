@@ -107,7 +107,9 @@ class Trainer(TrainerInterface):
                 "ssl_pretraining does not support distributed training yet"
             )
         device = devices[0]
-        hypers = self.hypers
+        # the view builders also read the atomic types of the dataset (a runtime
+        # key, not a hyperparameter: ``self.hypers`` is unchanged)
+        hypers = {**self.hypers, "atomic_types": list(model.dataset_info.atomic_types)}
 
         student = model.core
         if hypers["restart_from"] is not None:

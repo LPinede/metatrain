@@ -1,5 +1,6 @@
 from metatrain.pet import PET
 
+from . import high_order  # noqa: F401 (registers the ``high_order`` view builder)
 from .trainer import Trainer
 
 

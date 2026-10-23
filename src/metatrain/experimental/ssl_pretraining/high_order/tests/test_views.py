@@ -1,0 +1,401 @@
+import copy
+from dataclasses import fields
+
+import pytest
+import torch
+
+from metatrain.experimental.ssl_pretraining.high_order import views as ho_views
+from metatrain.experimental.ssl_pretraining.high_order.deformations import (
+    shear_matrix,
+)
+from metatrain.experimental.ssl_pretraining.high_order.views import (
+    HighOrderExtras,
+    build_high_order_views,
+)
+from metatrain.experimental.ssl_pretraining.objective import (
+    RESERVED_EXTRAS,
+    VIEW_BUILDERS,
+)
+from metatrain.experimental.ssl_pretraining.views import pair_vectors
+
+
+def _views(batch, seed=0, position_gradients=True, **over):
+    systems, options, hypers = batch
+    hypers = copy.deepcopy(hypers)
+    hypers["high_order"].update(over)
+    generator = torch.Generator().manual_seed(seed)
+    views = build_high_order_views(
+        systems, options, hypers, generator, position_gradients
+    )
+    return systems, options, views
+
+
+def _min_image(vectors, cell, pbc):
+    """Minimum-image version of ``vectors`` (unchanged without periodicity)."""
+    if not bool(pbc.any()):
+        return vectors
+    frac = vectors @ torch.linalg.inv(cell)
+    return (frac - torch.round(frac)) @ cell
+
+
+def test_registered_on_import():
+    assert VIEW_BUILDERS["high_order"] is build_high_order_views
+
+
+def test_student_frame_is_rotated_teacher_frame(small_batch):
+    systems, _, v = _views(small_batch, p_def=0.0)  # mask-only: no deformation
+    ho = v.extras["high_order"]
+    offset = 0
+    for s, st in zip(systems, v.student, strict=True):
+        rot = ho.rotations[offset]  # every atom carries its structure's rotation
+        n = len(s)
+        assert torch.allclose(ho.rotations[offset : offset + n], rot.expand(n, 3, 3))
+        assert torch.allclose(st.positions, s.positions @ rot.T, atol=1e-6)
+        offset += n
+    assert torch.equal(ho.rotations, v.rotations)
+
+
+def test_deformed_branch_bounds_and_targets(small_batch):
+    systems, _, v = _views(small_batch, p_def=1.0)
+    ho = v.extras["high_order"]
+    skin = small_batch[2]["noise"]["skin"]
+    assert ho.u_student.norm(dim=-1).max() <= skin / 2 + 1e-6
+    assert ho.u_student.abs().max() > 0
+    assert ho.branch_deformed.all() and not ho.branch_masked.any()
+    assert not v.masked.any()
+    assert torch.allclose(
+        ho.observed_vectors - ho.clean_vectors,
+        ho.u_student[ho.pair_index[:, 1]] - ho.u_student[ho.pair_index[:, 0]],
+        atol=1e-6,
+    )
+    offset = 0
+    for s, st in zip(systems, v.student, strict=True):
+        n = len(s)
+        u = ho.u_student[offset : offset + n]
+        rot = ho.rotations[offset]
+        assert torch.allclose(st.positions, (s.positions + u) @ rot.T, atol=1e-6)
+        offset += n
+
+
+@pytest.mark.parametrize("p_def", [0.0, 1.0])
+def test_student_pairs_follow_the_displacement(large_batch, p_def):
+    """The student pair vectors (with cell shifts for the periodic crystal), mapped
+    back to the teacher frame, are the displaced clean pair vectors."""
+    systems, options, v = _views(large_batch, p_def=p_def)
+    ho = v.extras["high_order"]
+    offset, pair_offset = 0, 0
+    for s, st in zip(systems, v.student, strict=True):
+        n = len(s)
+        atoms = slice(offset, offset + n)
+        samples = s.get_neighbor_list(options).samples.values
+        displaced = pair_vectors(s.positions + ho.u_student[atoms], s.cell, samples)
+        masked = v.masked[atoms]
+        keep = ~(masked[samples[:, 0]] | masked[samples[:, 1]])
+        student_vectors = st.get_neighbor_list(options).values.reshape(-1, 3)
+        rot = ho.rotations[offset]
+        torch.testing.assert_close(student_vectors @ rot, displaced[keep])
+        close = pair_vectors(s.positions, s.cell, samples).norm(dim=-1) < 4.0
+        n_close = int(close.sum())
+        rows = slice(pair_offset, pair_offset + n_close)
+        torch.testing.assert_close(ho.observed_vectors[rows], displaced[close])
+        offset += n
+        pair_offset += n_close
+    assert pair_offset == ho.pair_index.shape[0]
+
+
+def test_masked_branch_has_no_student_deformation(large_batch):
+    _, _, v = _views(large_batch, p_def=0.0)
+    ho = v.extras["high_order"]
+    assert ho.branch_masked.all() and not ho.branch_deformed.any()
+    assert v.masked.any()
+    assert torch.equal(ho.u_student, torch.zeros_like(ho.u_student))
+    assert torch.equal(ho.u_smooth, torch.zeros_like(ho.u_smooth))
+    assert torch.equal(ho.grad_smooth, torch.zeros_like(ho.grad_smooth))
+    assert torch.equal(ho.observed_vectors, ho.clean_vectors)
+
+
+def test_teacher_pair_is_antithetic(small_batch):
+    systems, _, v = _views(small_batch, p_def=1.0)
+    plus, minus = v.teacher, v.extras["teacher_views"]["minus"]  # teacher = plus
+    assert set(v.extras["teacher_views"]) == {"minus"}
+    skin = small_batch[2]["noise"]["skin"]
+    moved = False
+    for s, p, m in zip(systems, plus, minus, strict=True):
+        assert torch.allclose(p.positions + m.positions, 2 * s.positions, atol=1e-6)
+        u_t = (p.positions - s.positions).norm(dim=-1)
+        assert u_t.max() <= skin / 2 + 1e-6
+        moved = moved or bool(u_t.max() > 0)
+    assert moved
+
+
+def test_teacher_mode_is_the_sum_of_centre_modes(large_batch):
+    """The teacher displacement is the windowed l=1 modes of the centres, with
+    minimum-image relative positions in the periodic crystal."""
+    systems, _, v = _views(large_batch, p_def=1.0, mode_amplitude=0.01)
+    ho = v.extras["high_order"]
+    window = large_batch[2]["high_order"]["mode_window"]
+    offset = 0
+    for s, p in zip(systems, v.teacher, strict=True):
+        n = len(s)
+        mine = (ho.centers >= offset) & (ho.centers < offset + n)
+        expected = torch.zeros_like(s.positions)
+        centers, amplitudes = ho.centers[mine] - offset, ho.center_amplitudes[mine]
+        for c, a in zip(centers, amplitudes, strict=True):
+            rel = _min_image(s.positions - s.positions[c], s.cell, s.pbc)
+            w = torch.exp(-((rel.norm(dim=-1) / window) ** 2))[:, None]
+            linear = (
+                a[0] / 3**0.5 * rel
+                + torch.cross(a[1:4].expand_as(rel), rel, dim=-1)
+                + rel @ shear_matrix(a[None, 4:9])[0].T
+            )
+            expected = expected + w * linear
+        torch.testing.assert_close(p.positions - s.positions, expected)
+        offset += n
+
+
+def test_centers_are_far_from_mask(large_batch):
+    systems, options, v = _views(large_batch, p_def=0.0)
+    ho = v.extras["high_order"]
+    hypers = large_batch[2]["high_order"]
+    assert ho.centers.numel() > 0
+    # no centre has a masked atom within the cutoff
+    near = ho.pair_index[ho.hidden_source, 0]
+    assert not torch.isin(ho.centers, near).any()
+    assert not v.masked[ho.centers].any()
+    assert ho.context[ho.centers].all()
+    # at least 3 neighbours within the cutoff (identifiable l=1 amplitudes)
+    counts = torch.bincount(ho.pair_index[:, 0], minlength=len(v.masked))
+    assert (counts[ho.centers] >= 3).all()
+    offset = 0
+    for s in systems:
+        n = len(s)
+        mine = ho.centers[(ho.centers >= offset) & (ho.centers < offset + n)] - offset
+        assert len(mine) <= hypers["max_centers"]
+        for a in range(len(mine)):
+            for b in range(a):
+                d = s.positions[mine[a]] - s.positions[mine[b]]
+                assert _min_image(d, s.cell, s.pbc).norm() >= 2 * options.cutoff
+        offset += n
+
+
+def test_one_sided_teacher(small_batch):
+    systems, _, v = _views(small_batch, p_def=1.0, teacher_pair=False)
+    assert set(v.extras["teacher_views"]) == {"plus"}
+    moved = False
+    for s, t, p in zip(
+        systems, v.teacher, v.extras["teacher_views"]["plus"], strict=True
+    ):
+        assert torch.equal(t.positions, s.positions)  # the clean x0
+        moved = moved or bool((p.positions != s.positions).any())
+    assert moved
+
+
+def test_reproducible(large_batch):
+    _, _, a = _views(large_batch)
+    _, _, b = _views(large_batch)
+    for f in fields(HighOrderExtras):
+        assert torch.equal(
+            getattr(a.extras["high_order"], f.name),
+            getattr(b.extras["high_order"], f.name),
+        ), f.name
+    for sa, sb in zip(a.student, b.student, strict=True):
+        assert torch.equal(sa.positions, sb.positions)
+    _, _, c = _views(large_batch, seed=1)
+    assert not torch.equal(
+        a.extras["high_order"].rotations, c.extras["high_order"].rotations
+    )
+
+
+def test_tiny_structures_have_no_centers_and_no_nan(tiny_batch):
+    for p_def in (0.0, 1.0):
+        systems, _, v = _views(tiny_batch, p_def=p_def)
+        ho = v.extras["high_order"]
+        assert ho.centers.numel() == 0
+        assert ho.center_amplitudes.shape == (0, 9)
+        for f in fields(HighOrderExtras):
+            value = getattr(ho, f.name)
+            if value.is_floating_point():
+                assert torch.isfinite(value).all(), f.name
+        for s, t in zip(systems, v.teacher, strict=True):
+            assert torch.equal(t.positions, s.positions)  # no centre: u_T = 0
+
+
+@pytest.mark.parametrize("position_gradients", [True, False])
+def test_position_gradients_honoured(small_batch, position_gradients):
+    for teacher_pair in (True, False):
+        _, _, v = _views(
+            small_batch,
+            position_gradients=position_gradients,
+            teacher_pair=teacher_pair,
+        )
+        for system in v.student + v.teacher:
+            assert system.positions.requires_grad == position_gradients
+        for extra in v.extras["teacher_views"].values():
+            for system in extra:
+                assert not system.positions.requires_grad
+
+
+def test_extras_keys_are_not_reserved(small_batch):
+    _, _, v = _views(small_batch)
+    assert set(v.extras) == {"high_order", "teacher_views"}
+    assert not set(v.extras) & set(RESERVED_EXTRAS)
+    assert isinstance(v.extras["high_order"], HighOrderExtras)
+
+
+def test_views_fields(large_batch):
+    systems, _, v = _views(large_batch, p_def=0.0)
+    ho = v.extras["high_order"]
+    n_atoms = sum(len(s) for s in systems)
+    assert v.masked.shape == (n_atoms,) and v.masked.dtype == torch.bool
+    # latent targets: masked atoms with a visible neighbour within the cutoff, and
+    # every visible atom
+    reachable = torch.zeros_like(v.masked)
+    pairs = ho.pair_index
+    reachable[pairs[~v.masked[pairs[:, 1]], 0]] = True
+    assert torch.equal(v.latent_targets, (v.masked & reachable) | ~v.masked)
+    for name in ["displacements", "in_masked_structure", "gradient_targets"]:
+        assert getattr(v, name) is None
+    assert v.pairs is None and v.vectors is None
+
+
+def test_extras_shapes_and_consistency(large_batch):
+    systems, options, v = _views(large_batch, p_def=0.5)
+    ho = v.extras["high_order"]
+    n_structures = len(systems)
+    n_atoms = sum(len(s) for s in systems)
+    n_pairs = ho.pair_index.shape[0]
+    n_centers = ho.centers.shape[0]
+    dtype = systems[0].positions.dtype
+    expected = {
+        "branch_masked": ((n_structures,), torch.bool),
+        "branch_deformed": ((n_structures,), torch.bool),
+        "rotations": ((n_atoms, 3, 3), dtype),
+        "u_student": ((n_atoms, 3), dtype),
+        "grad_smooth": ((n_atoms, 3, 3), dtype),
+        "u_smooth": ((n_atoms, 3), dtype),
+        "pair_index": ((n_pairs, 2), torch.long),
+        "clean_vectors": ((n_pairs, 3), dtype),
+        "observed_vectors": ((n_pairs, 3), dtype),
+        "hidden_source": ((n_pairs,), torch.bool),
+        "boundary": ((n_atoms,), torch.bool),
+        "context": ((n_atoms,), torch.bool),
+        "centers": ((n_centers,), torch.long),
+        "center_amplitudes": ((n_centers, 9), dtype),
+        "species": ((n_atoms,), torch.int32),
+        "species_index": ((n_atoms,), torch.long),
+        "structure_index": ((n_atoms,), torch.long),
+        "student_pairs": ((ho.student_pairs.shape[0], 2), torch.long),
+        "student_distances": ((ho.student_pairs.shape[0],), dtype),
+    }
+    assert {f.name for f in fields(HighOrderExtras)} == set(expected)
+    for name, (shape, field_dtype) in expected.items():
+        value = getattr(ho, name)
+        assert value.shape == shape, name
+        assert value.dtype == field_dtype, name
+        assert not value.requires_grad, name
+
+    # branches are complementary
+    assert torch.equal(ho.branch_masked, ~ho.branch_deformed)
+    # per-atom bookkeeping
+    sizes = torch.tensor([len(s) for s in systems])
+    assert torch.equal(
+        ho.structure_index, torch.repeat_interleave(torch.arange(n_structures), sizes)
+    )
+    types = torch.cat([s.types for s in systems])
+    assert torch.equal(ho.species, types)
+    atomic_types = torch.tensor(large_batch[2]["atomic_types"])
+    assert torch.equal(atomic_types[ho.species_index], types.long())
+    # masked atoms only in the mask-only branch
+    assert not (v.masked & ho.branch_deformed[ho.structure_index]).any()
+    # pairs: clean, below the cutoff, within a structure
+    assert (ho.clean_vectors.norm(dim=-1) < options.cutoff).all()
+    assert torch.equal(
+        ho.structure_index[ho.pair_index[:, 0]],
+        ho.structure_index[ho.pair_index[:, 1]],
+    )
+    assert torch.equal(ho.hidden_source, v.masked[ho.pair_index[:, 1]])
+    # boundary and context partition the visible atoms
+    assert not (ho.boundary & ho.context).any()
+    assert torch.equal(ho.boundary | ho.context, ~v.masked)
+    touches = ho.hidden_source & ~v.masked[ho.pair_index[:, 0]]
+    assert torch.equal(
+        ho.boundary.nonzero().squeeze(-1),
+        ho.pair_index[touches, 0].unique(),
+    )
+    # the smooth part is the field of the deformed structures
+    deformed_atoms = ho.branch_deformed[ho.structure_index]
+    assert not ho.u_smooth[~deformed_atoms].any()
+    assert not ho.grad_smooth[~deformed_atoms].any()
+    assert ho.u_smooth[deformed_atoms].abs().max() > 0
+    # student pairs: the kept pairs of the student views, below the cutoff
+    assert (ho.student_distances < options.cutoff).all()
+    assert not v.masked[ho.student_pairs].any()
+    offset, pairs, distances = 0, [], []
+    for s, st in zip(systems, v.student, strict=True):
+        nl = st.get_neighbor_list(options)
+        d = nl.values.reshape(-1, 3).norm(dim=-1).detach()
+        close = d < options.cutoff
+        pairs.append(nl.samples.values[close, :2] + offset)
+        distances.append(d[close])
+        offset += len(s)
+    assert torch.equal(ho.student_pairs, torch.cat(pairs))
+    torch.testing.assert_close(ho.student_distances, torch.cat(distances))
+
+
+def test_periodic_structures_use_the_periodic_field(large_batch, monkeypatch):
+    calls = []
+    smooth = ho_views.smooth_field_with_gradient
+    periodic = ho_views.periodic_field_with_gradient
+
+    def spy_smooth(*args, **kwargs):
+        calls.append("smooth")
+        return smooth(*args, **kwargs)
+
+    def spy_periodic(*args, **kwargs):
+        calls.append("periodic")
+        return periodic(*args, **kwargs)
+
+    monkeypatch.setattr(ho_views, "smooth_field_with_gradient", spy_smooth)
+    monkeypatch.setattr(ho_views, "periodic_field_with_gradient", spy_periodic)
+    _views(large_batch, p_def=1.0)
+    assert calls == ["smooth", "periodic"]  # the molecule, then the crystal
+
+
+def test_unknown_species_raises(small_batch):
+    systems, options, hypers = small_batch
+    hypers = copy.deepcopy(hypers)
+    hypers["atomic_types"] = [1, 6]  # QM9 frames also hold N and O
+    with pytest.raises(ValueError, match="atomic_types"):
+        build_high_order_views(
+            systems, options, hypers, torch.Generator().manual_seed(0), True
+        )
+
+
+def _devices():
+    devices = [torch.device("cpu")]
+    if torch.backends.mps.is_available():
+        devices.append(torch.device("mps"))
+    if torch.cuda.is_available():
+        devices.append(torch.device("cuda"))
+    return devices
+
+
+@pytest.mark.parametrize("device", _devices())
+def test_views_follow_the_device(large_batch, device):
+    """Same random draws on every device: the views agree with the CPU ones."""
+    systems, options, hypers = large_batch
+    systems = [s.to(dtype=torch.float32) for s in systems]
+    _, _, ref = _views((systems, options, hypers), p_def=0.5)
+    moved = [s.to(device=device) for s in systems]
+    _, _, v = _views((moved, options, hypers), p_def=0.5)
+    ho, ref_ho = v.extras["high_order"], ref.extras["high_order"]
+    for f in fields(HighOrderExtras):
+        value = getattr(ho, f.name)
+        assert value.device.type == device.type, f.name
+        torch.testing.assert_close(
+            value.cpu(), getattr(ref_ho, f.name), atol=1e-5, rtol=1e-5
+        )
+    for name in ["student", "teacher"]:
+        for s, r in zip(getattr(v, name), getattr(ref, name), strict=True):
+            assert s.positions.device.type == device.type
+            torch.testing.assert_close(s.positions.detach().cpu(), r.positions)

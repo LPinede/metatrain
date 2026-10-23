@@ -15,6 +15,64 @@ if TYPE_CHECKING:
     from .terms import Term
 
 
+def sample_mask(
+    n_atoms: int,
+    pairs: torch.Tensor,
+    distances: torch.Tensor,
+    mask_hypers: Dict[str, Any],
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Sample the masked atoms of one system, as configured by the ``mask`` hypers.
+
+    A region is sampled (with probability ``mask.probability``, for systems of at
+    least ``mask.min_atoms`` atoms) and assigned to the masked role, or to the
+    context role with probability ``mask.swap_probability``. A degenerate region
+    (all or no atoms masked) gives no mask.
+
+    :param n_atoms: Number of atoms.
+    :param pairs: Pair atom indices, shape ``(n_pairs, 2)``, on CPU.
+    :param distances: Pair distances, shape ``(n_pairs,)``, on CPU.
+    :param mask_hypers: The ``mask`` trainer hypers.
+    :param generator: CPU random generator.
+    :return: Boolean mask of the masked atoms, shape ``(n_atoms,)``, on CPU.
+    """
+    masked = torch.zeros(n_atoms, dtype=torch.bool)
+    apply_mask = (
+        n_atoms >= mask_hypers["min_atoms"]
+        and float(torch.rand(1, generator=generator)) < mask_hypers["probability"]
+    )
+    if apply_mask:
+        if mask_hypers["generator"] == "nl_ball":
+            low, high = mask_hypers["fraction_range"]
+            fraction = low + (high - low) * float(torch.rand(1, generator=generator))
+            region = nl_ball_region(
+                n_atoms,
+                pairs,
+                distances,
+                mask_hypers["ball_radius_range"],
+                fraction,
+                generator,
+            )
+        elif mask_hypers["generator"] == "k_hop_ego":
+            region = k_hop_ego_region(
+                n_atoms,
+                pairs,
+                distances,
+                mask_hypers["ego_hops"],
+                mask_hypers["topology_cutoff"],
+                generator,
+            )
+        else:
+            raise ValueError(f"unknown mask generator '{mask_hypers['generator']}'")
+        swap = (
+            float(torch.rand(1, generator=generator)) < mask_hypers["swap_probability"]
+        )
+        masked = ~region if swap else region
+        if bool(masked.all()) or not bool(masked.any()):
+            masked = torch.zeros_like(masked)  # degenerate region: no mask
+    return masked
+
+
 @dataclass
 class Views:
     """Student/teacher views of a batch and the per-atom bookkeeping.
@@ -118,43 +176,7 @@ def build_views(
 
         # mask: a region, assigned to the masked role (or to the context role
         # with probability ``swap_probability``)
-        masked = torch.zeros(n_atoms, dtype=torch.bool)
-        apply_mask = (
-            n_atoms >= mask_hypers["min_atoms"]
-            and float(torch.rand(1, generator=generator)) < mask_hypers["probability"]
-        )
-        if apply_mask:
-            if mask_hypers["generator"] == "nl_ball":
-                low, high = mask_hypers["fraction_range"]
-                fraction = low + (high - low) * float(
-                    torch.rand(1, generator=generator)
-                )
-                region = nl_ball_region(
-                    n_atoms,
-                    pairs_cpu,
-                    distances_cpu,
-                    mask_hypers["ball_radius_range"],
-                    fraction,
-                    generator,
-                )
-            elif mask_hypers["generator"] == "k_hop_ego":
-                region = k_hop_ego_region(
-                    n_atoms,
-                    pairs_cpu,
-                    distances_cpu,
-                    mask_hypers["ego_hops"],
-                    mask_hypers["topology_cutoff"],
-                    generator,
-                )
-            else:
-                raise ValueError(f"unknown mask generator '{mask_hypers['generator']}'")
-            swap = (
-                float(torch.rand(1, generator=generator))
-                < mask_hypers["swap_probability"]
-            )
-            masked = ~region if swap else region
-            if bool(masked.all()) or not bool(masked.any()):
-                masked = torch.zeros_like(masked)  # degenerate region: no mask
+        masked = sample_mask(n_atoms, pairs_cpu, distances_cpu, mask_hypers, generator)
         masked = masked.to(device)
 
         # student view: clean, rotated, masked pairs removed
