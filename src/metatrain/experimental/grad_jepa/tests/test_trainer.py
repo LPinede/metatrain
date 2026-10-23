@@ -4,6 +4,7 @@ import ase.io
 import pytest
 import torch
 
+from metatrain.experimental.grad_jepa import objective
 from metatrain.experimental.grad_jepa.documentation import TrainerHypers
 from metatrain.experimental.grad_jepa.trainer import (
     Trainer,
@@ -197,7 +198,11 @@ def test_collate_global_augmentation(augment):
         )
 
 
-def test_train_latent_only(tmp_path):
+def test_train_latent_only(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("probe gradients computed in latent-only mode")
+
+    monkeypatch.setattr(objective, "random_scalar_gradients", forbidden)
     torch.manual_seed(0)
     dataset = _dataset()
     hypers = _trainer_hypers(num_epochs=1)

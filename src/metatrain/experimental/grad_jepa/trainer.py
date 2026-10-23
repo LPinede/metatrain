@@ -112,6 +112,7 @@ class Trainer(TrainerInterface):
         options = student.requested_neighbor_lists()[0]
         check_hypers(hypers, options.cutoff)
         terms = build_terms(hypers["objective"]["terms"])
+        ROOT_LOGGER.info("Active loss terms: " + ", ".join(term.name for term in terms))
         feature_dim = student.num_readout_layers * (student.d_node + student.d_pet)
         predictor = GradJEPAPredictor(
             feature_dim=feature_dim,

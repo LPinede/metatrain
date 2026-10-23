@@ -4,7 +4,11 @@ A term is a class with the attributes of :class:`Term`, constructed from its hyp
 (``cls(**hypers)``, the entry of ``objective.terms`` under its name) and called on
 the :class:`StepData` of every batch. It returns its already weighted loss and its
 diagnostics. New terms are added with :func:`register_term`, together with their
-hypers ``TypedDict`` in ``TermsHypers`` (``documentation.py``).
+hypers ``TypedDict`` as a ``NotRequired[Optional[...]]`` entry of ``TermsHypers``
+(``documentation.py``), and the module registering them must be imported before
+:func:`build_terms` runs. Under ``mtt train`` the options are merged with the
+defaults, so a default term omitted from the options stays enabled: disable it
+with ``null``.
 """
 
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, TypeVar
