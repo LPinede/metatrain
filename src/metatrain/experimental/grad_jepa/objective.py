@@ -422,6 +422,10 @@ def build_step_data(
     return step
 
 
+RESERVED_DIAGNOSTICS = ("loss", "masked_fraction", "rankme")
+"""Metric names set by the objective and the trainer, not usable by the terms."""
+
+
 def grad_jepa_loss(
     student: torch.nn.Module,
     teacher: torch.nn.Module,
@@ -467,6 +471,8 @@ def grad_jepa_loss(
         term_loss, diagnostics = term(step)
         losses.append(term_loss)
         for name, value in diagnostics.items():
+            if name in RESERVED_DIAGNOSTICS:
+                raise ValueError(f"diagnostic name '{name}' is reserved")
             if name in metrics:
                 raise ValueError(f"diagnostic '{name}' is reported by two terms")
             metrics[name] = value

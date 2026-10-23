@@ -359,3 +359,46 @@ def test_null_disables_a_default_term_after_merging():
     check_architecture_options(name="experimental.grad_jepa", options=merged)
     names = [t.name for t in build_terms(merged["training"]["objective"]["terms"])]
     assert names == ["latent", "vicreg", "gradient_spread"]
+
+
+class _Reporting:
+    """A test-only term that reports one diagnostic under a given name."""
+
+    needs_gradients = False
+    required_targets: dict = {}
+
+    def __init__(self, name: str, diagnostic: str) -> None:
+        self.name = name
+        self.diagnostic = diagnostic
+
+    def __call__(self, step):
+        loss = step.student_features.sum() * 0.0
+        return loss, {self.diagnostic: loss}
+
+
+@pytest.mark.parametrize(
+    "diagnostic, match",
+    [
+        ("latent_masked", "reported by two terms"),
+        ("loss", "reserved"),
+        ("masked_fraction", "reserved"),
+        ("rankme", "reserved"),
+    ],
+)
+def test_diagnostic_names_cannot_collide(diagnostic, match):
+    student, teacher, predictor, systems, options, hypers = _setup(
+        ase.io.read(QM9_PATH, ":2"), torch.float64
+    )
+    active = build_terms(LATENT_ONLY) + [_Reporting("reporting", diagnostic)]
+    with pytest.raises(ValueError, match=match):
+        grad_jepa_loss(
+            student,
+            teacher,
+            predictor,
+            active,
+            systems,
+            options,
+            hypers,
+            torch.Generator().manual_seed(0),
+            with_rank=True,
+        )
