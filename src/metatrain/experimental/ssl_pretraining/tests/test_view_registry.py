@@ -157,13 +157,42 @@ def test_other_builder_gets_tokens_and_extra_teacher_features(monkeypatch):
     assert tokens.node.shape[0] == step.student_features.shape[0]
 
 
+@pytest.mark.parametrize(
+    "key", ["teacher_features", "step_fraction", "generator", "student_tokens"]
+)
+def test_reserved_extras_keys_are_rejected(monkeypatch, key):
+    student, teacher, predictor, systems, options, hypers = _setup(
+        ase.io.read(QM9_PATH, ":2"), torch.float64
+    )
+    monkeypatch.setattr(objective, "VIEW_BUILDERS", dict(VIEW_BUILDERS))
+
+    def clashing(systems, options, hypers, generator, position_gradients=True):
+        views = build_views(systems, options, hypers, generator, position_gradients)
+        views.extras = {key: None}
+        return views
+
+    register_view_builder("clashing", clashing)
+    hypers["views"]["builder"] = "clashing"
+    with pytest.raises(ValueError, match=f"reserved extras key.*{key}"):
+        build_step_data(
+            student,
+            teacher,
+            predictor,
+            systems,
+            options,
+            hypers,
+            torch.Generator().manual_seed(0),
+            needs_gradients=False,
+        )
+
+
 def test_uses_prediction_flags():
     flags = {name: TERMS[name].uses_prediction for name in TERMS}
     assert flags == {
         "latent": True,
         "gradient": True,
         "vicreg": False,
-        "gradient_spread": True,
+        "gradient_spread": False,
     }
 
 

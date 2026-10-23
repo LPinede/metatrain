@@ -24,8 +24,8 @@ class Views:
     gradients back to the teacher frame, and ``masked`` gives the context atoms
     (``~masked``) of the ``vicreg`` term and of the ``masked_fraction`` and
     ``rankme`` diagnostics. The optional fields are filled by the Grad-JEPA builder
-    (:func:`build_views`) for its predictor (``displacements``, ``masked``,
-    ``pairs``, ``vectors``) and terms (``latent_targets`` and
+    (:func:`build_views`) for its predictor (``displacements``, ``pairs`` and
+    ``vectors``, besides the required ``masked``) and terms (``latent_targets`` and
     ``in_masked_structure`` for ``latent``; ``gradient_targets`` and
     ``in_masked_structure`` for ``gradient``; ``gradient_targets`` for
     ``gradient_spread``). ``extras`` holds builder-specific data; its key
@@ -391,6 +391,10 @@ class StepData:
     extras: Dict[str, Any] = field(default_factory=dict)
 
 
+RESERVED_EXTRAS = ("teacher_features", "step_fraction", "generator", "student_tokens")
+"""``StepData.extras`` keys set by the objective, not usable by view builders."""
+
+
 def build_step_data(
     student: torch.nn.Module,
     teacher: torch.nn.Module,
@@ -425,6 +429,12 @@ def build_step_data(
     builder = hypers["views"]["builder"]
     views = VIEW_BUILDERS[builder](systems, options, hypers, generator, needs_gradients)
 
+    reserved = set(views.extras) & set(RESERVED_EXTRAS)
+    if reserved:
+        raise ValueError(
+            f"view builder '{builder}' uses the reserved extras key(s) "
+            f"{sorted(reserved)}"
+        )
     extras: Dict[str, Any] = dict(views.extras)
     if builder == "grad_jepa":
         student_features = backbone.features(student, views.student)

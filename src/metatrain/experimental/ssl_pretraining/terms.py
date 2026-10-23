@@ -219,7 +219,7 @@ class GradientSpreadTerm:
 
     name = "gradient_spread"
     needs_gradients = True
-    uses_prediction = True
+    uses_prediction = False
 
     def __init__(self, weight: float, floor: float) -> None:
         self.weight = weight

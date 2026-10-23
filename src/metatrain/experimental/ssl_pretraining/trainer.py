@@ -187,9 +187,11 @@ class Trainer(TrainerInterface):
         if len(val_dataloader) == 0:
             raise ValueError("ssl_pretraining needs a non-empty validation set")
 
-        parameters = list(student.parameters()) + list(term_modules.parameters())
+        # student, predictor, terms: the order of the saved optimizer state
+        parameters = list(student.parameters())
         if predictor is not None:
             parameters += list(predictor.parameters())
+        parameters += list(term_modules.parameters())
         optimizer = torch.optim.AdamW(
             parameters, lr=hypers["learning_rate"], weight_decay=hypers["weight_decay"]
         )
