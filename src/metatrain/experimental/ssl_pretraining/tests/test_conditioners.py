@@ -6,17 +6,17 @@ import ase.io
 import pytest
 import torch
 
-from metatrain.experimental.grad_jepa import conditioners
-from metatrain.experimental.grad_jepa.conditioners import (
+from metatrain.experimental.ssl_pretraining import conditioners
+from metatrain.experimental.ssl_pretraining.conditioners import (
     CONDITIONERS,
     build_conditioners,
     register_conditioner,
 )
-from metatrain.experimental.grad_jepa.documentation import ConditionersHypers
-from metatrain.experimental.grad_jepa.objective import grad_jepa_loss
-from metatrain.experimental.grad_jepa.predictor import GradJEPAPredictor
-from metatrain.experimental.grad_jepa.terms import build_terms
-from metatrain.experimental.grad_jepa.views import random_rotations
+from metatrain.experimental.ssl_pretraining.documentation import ConditionersHypers
+from metatrain.experimental.ssl_pretraining.objective import grad_jepa_loss
+from metatrain.experimental.ssl_pretraining.predictor import GradJEPAPredictor
+from metatrain.experimental.ssl_pretraining.terms import build_terms
+from metatrain.experimental.ssl_pretraining.views import random_rotations
 from metatrain.utils.architectures import check_architecture_options, get_default_hypers
 from metatrain.utils.pydantic import MetatrainValidationError
 
@@ -255,15 +255,17 @@ def test_objective_contract_with_a_conditioner(registered, num_layers):
 
 
 def _options(predictor_hypers):
-    options = copy.deepcopy(get_default_hypers("experimental.grad_jepa"))
+    options = copy.deepcopy(get_default_hypers("experimental.ssl_pretraining"))
     options["training"]["predictor"].update(predictor_hypers)
     return options
 
 
 def test_yaml_defaults_and_depth():
     options = _options({"num_layers": 3, "conditioners": {}})
-    check_architecture_options(name="experimental.grad_jepa", options=options)
-    default = get_default_hypers("experimental.grad_jepa")["training"]["predictor"]
+    check_architecture_options(name="experimental.ssl_pretraining", options=options)
+    default = get_default_hypers("experimental.ssl_pretraining")["training"][
+        "predictor"
+    ]
     assert default["num_layers"] == 1
     assert default["conditioners"] == {}
 
@@ -279,5 +281,5 @@ def test_yaml_defaults_and_depth():
 def test_yaml_rejects_invalid_predictor_hypers(predictor_hypers, match):
     with pytest.raises(MetatrainValidationError, match=match):
         check_architecture_options(
-            name="experimental.grad_jepa", options=_options(predictor_hypers)
+            name="experimental.ssl_pretraining", options=_options(predictor_hypers)
         )

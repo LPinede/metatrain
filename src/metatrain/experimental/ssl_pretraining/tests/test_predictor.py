@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from metatrain.experimental.grad_jepa.predictor import GradJEPAPredictor
-from metatrain.experimental.grad_jepa.views import random_rotations
+from metatrain.experimental.ssl_pretraining.predictor import GradJEPAPredictor
+from metatrain.experimental.ssl_pretraining.views import random_rotations
 
 from .conftest import D, N
 

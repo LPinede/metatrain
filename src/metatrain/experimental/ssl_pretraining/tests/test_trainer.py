@@ -4,11 +4,11 @@ import ase.io
 import pytest
 import torch
 
-from metatrain.experimental.grad_jepa import objective
-from metatrain.experimental.grad_jepa import terms as terms_module
-from metatrain.experimental.grad_jepa import trainer as trainer_module
-from metatrain.experimental.grad_jepa.documentation import TrainerHypers
-from metatrain.experimental.grad_jepa.trainer import (
+from metatrain.experimental.ssl_pretraining import objective
+from metatrain.experimental.ssl_pretraining import terms as terms_module
+from metatrain.experimental.ssl_pretraining import trainer as trainer_module
+from metatrain.experimental.ssl_pretraining.documentation import TrainerHypers
+from metatrain.experimental.ssl_pretraining.trainer import (
     Trainer,
     check_hypers,
     get_collate_fns,

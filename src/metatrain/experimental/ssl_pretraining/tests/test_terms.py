@@ -7,10 +7,17 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from metatrain.experimental.grad_jepa import objective, terms
-from metatrain.experimental.grad_jepa.documentation import TermsHypers
-from metatrain.experimental.grad_jepa.objective import build_step_data, grad_jepa_loss
-from metatrain.experimental.grad_jepa.terms import TERMS, build_terms, register_term
+from metatrain.experimental.ssl_pretraining import objective, terms
+from metatrain.experimental.ssl_pretraining.documentation import TermsHypers
+from metatrain.experimental.ssl_pretraining.objective import (
+    build_step_data,
+    grad_jepa_loss,
+)
+from metatrain.experimental.ssl_pretraining.terms import (
+    TERMS,
+    build_terms,
+    register_term,
+)
 from metatrain.utils.architectures import check_architecture_options, get_default_hypers
 from metatrain.utils.pydantic import MetatrainValidationError
 
@@ -106,12 +113,12 @@ def _golden_inputs(config):
 
 def _only(name):
     """Terms hypers with only ``name`` enabled, at its default hypers."""
-    defaults = copy.deepcopy(get_default_hypers("experimental.grad_jepa"))
+    defaults = copy.deepcopy(get_default_hypers("experimental.ssl_pretraining"))
     return {name: defaults["training"]["objective"]["terms"][name]}
 
 
 def _architecture_options(terms_hypers):
-    options = copy.deepcopy(get_default_hypers("experimental.grad_jepa"))
+    options = copy.deepcopy(get_default_hypers("experimental.ssl_pretraining"))
     options["training"]["objective"]["terms"] = terms_hypers
     return options
 
@@ -135,7 +142,7 @@ def test_needs_gradients():
 
 
 def _only_all():
-    defaults = copy.deepcopy(get_default_hypers("experimental.grad_jepa"))
+    defaults = copy.deepcopy(get_default_hypers("experimental.ssl_pretraining"))
     return defaults["training"]["objective"]["terms"]
 
 
@@ -329,7 +336,7 @@ def test_latent_only_equals_full_objective_without_gradient_terms():
 
 def test_yaml_accepts_the_latent_only_baseline():
     check_architecture_options(
-        name="experimental.grad_jepa", options=_architecture_options(LATENT_ONLY)
+        name="experimental.ssl_pretraining", options=_architecture_options(LATENT_ONLY)
     )
 
 
@@ -346,17 +353,17 @@ def test_yaml_accepts_the_latent_only_baseline():
 def test_yaml_rejects_invalid_terms(terms_hypers, match):
     with pytest.raises(MetatrainValidationError, match=match):
         check_architecture_options(
-            name="experimental.grad_jepa",
+            name="experimental.ssl_pretraining",
             options=_architecture_options(terms_hypers),
         )
 
 
 def test_null_disables_a_default_term_after_merging():
     """``mtt train`` merges the defaults: absent terms come back, null removes."""
-    defaults = get_default_hypers("experimental.grad_jepa")
+    defaults = get_default_hypers("experimental.ssl_pretraining")
     user = {"training": {"objective": {"terms": {"gradient": None}}}}
     merged = OmegaConf.to_container(OmegaConf.merge(defaults, user))
-    check_architecture_options(name="experimental.grad_jepa", options=merged)
+    check_architecture_options(name="experimental.ssl_pretraining", options=merged)
     names = [t.name for t in build_terms(merged["training"]["objective"]["terms"])]
     assert names == ["latent", "vicreg", "gradient_spread"]
 

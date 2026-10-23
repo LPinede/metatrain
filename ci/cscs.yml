@@ -315,7 +315,7 @@ flashmd-symplectic-tests:
     SLURM_TIMELIMIT: '00:06:00'
     GIT_STRATEGY: fetch
 
-grad-jepa-tests:
+ssl-pretraining-tests:
   stage: test
   # Trigger tests as soon as base image is ready
   needs:
@@ -326,7 +326,7 @@ grad-jepa-tests:
   script:
     - rm -rf /tmp/tox/
     - tox -e check-cuda-available --workdir /tmp/tox/ --list-dependencies
-    - tox -e grad-jepa-tests --workdir /tmp/tox/ --list-dependencies
+    - tox -e ssl-pretraining-tests --workdir /tmp/tox/ --list-dependencies
   variables:
     SLURM_JOB_NUM_NODES: 1
     SLURM_PARTITION: normal

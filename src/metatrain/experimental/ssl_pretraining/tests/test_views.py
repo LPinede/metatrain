@@ -3,7 +3,7 @@ import pytest
 import torch
 from metatomic.torch import ModelOutput, NeighborListOptions, System
 
-from metatrain.experimental.grad_jepa.views import (
+from metatrain.experimental.ssl_pretraining.views import (
     bounded_noise,
     build_view,
     get_skin_neighbor_list_transform,

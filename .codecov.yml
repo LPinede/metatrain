@@ -65,10 +65,10 @@ component_management:
       paths:
         - "src/metatrain/experimental/classifier/.*"
 
-    - component_id: grad_jepa
-      name: Grad-JEPA
+    - component_id: ssl_pretraining
+      name: SSL pretraining
       paths:
-        - "src/metatrain/experimental/grad_jepa/.*"
+        - "src/metatrain/experimental/ssl_pretraining/.*"
 
     - component_id: mace
       name: MACE

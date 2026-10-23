@@ -73,14 +73,18 @@ class Trainer(TrainerInterface):
     ) -> MetatrainModel[PET, Scaler]:
         if len(dataset_info.targets) > 0:
             raise ValueError(
-                "grad_jepa pretraining is label-free: set `targets: {}` in the "
+                "ssl_pretraining is label-free: set `targets: {}` in the "
                 f"dataset options (got targets {list(dataset_info.targets)})"
             )
         if model_hypers["long_range"]["enable"]:
-            raise ValueError("grad_jepa does not support PET's long-range module yet")
+            raise ValueError(
+                "ssl_pretraining does not support PET's long-range module yet"
+            )
         if model_hypers["num_neighbors_adaptive"] is not None:
             # masking removes neighbors, which would change the adaptive cutoffs
-            raise ValueError("grad_jepa does not support PET's adaptive cutoff yet")
+            raise ValueError(
+                "ssl_pretraining does not support PET's adaptive cutoff yet"
+            )
         pet_trainer = PETTrainer(get_default_hypers("pet")["training"])
         return pet_trainer.setup(model_hypers, dataset_info)
 
@@ -91,7 +95,7 @@ class Trainer(TrainerInterface):
         model_hypers: Dict[str, Any],
     ) -> MetatrainModel[PET, Scaler]:
         raise ValueError(
-            "grad_jepa runs are resumed with the `restart_from` trainer option, "
+            "ssl_pretraining runs are resumed with the `restart_from` trainer option, "
             "not with `mtt train --restart`"
         )
 
@@ -106,7 +110,9 @@ class Trainer(TrainerInterface):
     ) -> None:
         assert dtype in PET.__supported_dtypes__
         if resolve_distributed(None):
-            raise ValueError("grad_jepa does not support distributed training yet")
+            raise ValueError(
+                "ssl_pretraining does not support distributed training yet"
+            )
         device = devices[0]
         hypers = self.hypers
 
@@ -177,7 +183,7 @@ class Trainer(TrainerInterface):
             shuffle=False,
         )
         if len(val_dataloader) == 0:
-            raise ValueError("grad_jepa needs a non-empty validation set")
+            raise ValueError("ssl_pretraining needs a non-empty validation set")
 
         parameters = (
             list(student.parameters())
@@ -301,14 +307,14 @@ class Trainer(TrainerInterface):
     def _load_restart_state(self, path: str, model: MetatrainModel) -> None:
         checkpoint = torch.load(path, weights_only=False, map_location="cpu")
         if "grad_jepa" not in checkpoint:
-            raise ValueError(f"'{path}' is not a grad_jepa checkpoint")
+            raise ValueError(f"'{path}' is not an ssl_pretraining checkpoint")
         version = checkpoint.get("trainer_ckpt_version")
         if (
             not isinstance(version, int)
             or not 1 <= version <= self.__checkpoint_version__
         ):
             raise ValueError(
-                f"cannot resume from '{path}': its grad_jepa trainer checkpoint "
+                f"cannot resume from '{path}': its ssl_pretraining trainer checkpoint "
                 f"version {version} is not supported (this trainer reads versions 1 "
                 f"to {self.__checkpoint_version__})"
             )
@@ -344,6 +350,7 @@ class Trainer(TrainerInterface):
                 "best_epoch": self.best_epoch,
                 "best_metric": self.best_metric,
                 "best_optimizer_state_dict": self.best_optimizer_state_dict,
+                # the pre-rename key, kept so that old checkpoints stay readable
                 "grad_jepa": {
                     "step": self.step,
                     "teacher_state_dict": self.teacher_state_dict,
@@ -362,7 +369,7 @@ class Trainer(TrainerInterface):
         context: Literal["restart", "finetune"],
     ) -> "Trainer":
         raise ValueError(
-            "grad_jepa runs are resumed with the `restart_from` trainer option"
+            "ssl_pretraining runs are resumed with the `restart_from` trainer option"
         )
 
     @classmethod

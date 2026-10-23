@@ -51,7 +51,7 @@ It also contains architectures meant to simplify tasks or augment the capabiliti
 | [Composition][arch-composition]               | Per-species linear fit to training targets                                                                                           |
 | [Scaler][arch-scaler]                         | Per-species, target and property scales for training targets.                                                                        |
 | [LLPR][arch-llpr]                             | Cheap uncertainty quantification via the last-layer prediction rigidity (LLPR) approach                                              |
-| [Grad-JEPA][arch-grad_jepa]                   | Label-free gradient-JEPA pretraining of PET backbones (experimental)                                                                 |
+| [SSL pretraining][arch-ssl_pretraining]       | Label-free self-supervised pretraining of PET backbones; Grad-JEPA objective (experimental)                                          |
 
 <!-- marker-arch-links -->
 
@@ -69,7 +69,7 @@ on a PR, since the docs use this README file directly.-->
 [arch-soap_bpnn]: https://docs.metatensor.org/metatrain/latest/architectures/generated/soap_bpnn.html
 [arch-flashmd_symplectic]: https://docs.metatensor.org/metatrain/latest/architectures/generated/flashmd_symplectic.html
 [arch-llpr]: https://docs.metatensor.org/metatrain/latest/architectures/generated/llpr.html
-[arch-grad_jepa]: https://docs.metatensor.org/metatrain/latest/architectures/generated/grad_jepa.html
+[arch-ssl_pretraining]: https://docs.metatensor.org/metatrain/latest/architectures/generated/ssl_pretraining.html
 
 <!-- marker-documentation -->
 

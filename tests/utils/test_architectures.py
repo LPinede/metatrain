@@ -36,7 +36,7 @@ def test_find_all_architectures():
     assert "experimental.classifier" in all_arches
     assert "experimental.dpa3" in all_arches
     assert "experimental.lorem" in all_arches
-    assert "experimental.grad_jepa" in all_arches
+    assert "experimental.ssl_pretraining" in all_arches
     assert "llpr" in all_arches
     assert "experimental.mace" in all_arches
     assert "composition" in all_arches

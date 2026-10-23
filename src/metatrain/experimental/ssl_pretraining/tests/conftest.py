@@ -3,7 +3,7 @@ import pytest
 import torch
 from metatomic.torch import NeighborListOptions
 
-from metatrain.experimental.grad_jepa.views import pair_vectors
+from metatrain.experimental.ssl_pretraining.views import pair_vectors
 from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
 
 from . import to_systems

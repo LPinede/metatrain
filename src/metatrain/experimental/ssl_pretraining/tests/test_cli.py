@@ -50,7 +50,7 @@ def test_pretrain_then_finetune(monkeypatch, tmp_path):
         {
             "seed": 0,
             "architecture": {
-                "name": "experimental.grad_jepa",
+                "name": "experimental.ssl_pretraining",
                 "model": MODEL,
                 "training": {
                     "num_epochs": 1,

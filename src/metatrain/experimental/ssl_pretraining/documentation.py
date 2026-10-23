@@ -1,9 +1,10 @@
 """
-Grad-JEPA (Experimental)
-========================
+SSL pretraining (Experimental)
+==============================
 
-Label-free pretraining of a :ref:`PET <architecture-pet>` backbone with a
-joint-embedding predictive objective on the *gradients* of the representation.
+Label-free self-supervised pretraining of a :ref:`PET <architecture-pet>` backbone
+(selected with the ``backbone`` model hyperparameter). The objective is Grad-JEPA:
+a joint-embedding predictive objective on the *gradients* of the representation.
 
 At every step, a batch of structures is turned into two views:
 

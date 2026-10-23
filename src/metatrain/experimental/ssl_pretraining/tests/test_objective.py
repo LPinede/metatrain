@@ -6,8 +6,8 @@ import ase.io
 import pytest
 import torch
 
-from metatrain.experimental.grad_jepa.documentation import TrainerHypers
-from metatrain.experimental.grad_jepa.objective import (
+from metatrain.experimental.ssl_pretraining.documentation import TrainerHypers
+from metatrain.experimental.ssl_pretraining.objective import (
     FEATURE_OUTPUT,
     build_views,
     grad_jepa_loss,
@@ -15,9 +15,9 @@ from metatrain.experimental.grad_jepa.objective import (
     relative_gradient_spread,
     vicreg_terms,
 )
-from metatrain.experimental.grad_jepa.predictor import GradJEPAPredictor
-from metatrain.experimental.grad_jepa.terms import build_terms
-from metatrain.experimental.grad_jepa.views import (
+from metatrain.experimental.ssl_pretraining.predictor import GradJEPAPredictor
+from metatrain.experimental.ssl_pretraining.terms import build_terms
+from metatrain.experimental.ssl_pretraining.views import (
     build_view,
     get_skin_neighbor_list_transform,
 )
