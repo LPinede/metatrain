@@ -5,12 +5,8 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import torch
 from metatomic.torch import NeighborListOptions
 
-from metatrain.pet import PET
-from metatrain.pet import Trainer as PETTrainer
 from metatrain.pet.trainer import get_scheduler
-from metatrain.scaler import Scaler
 from metatrain.utils.abc import TrainerInterface, common_upgrade_checkpoint
-from metatrain.utils.architectures import get_default_hypers
 from metatrain.utils.augmentation import O3Augmenter
 from metatrain.utils.data import (
     CollateFn,
@@ -30,6 +26,7 @@ from metatrain.utils.transfer import batch_to
 from metatrain.utils.wrapper import MetatrainModel
 
 from . import checkpoints
+from .backbones import BACKBONES, Backbone
 from .conditioners import build_conditioners
 from .objective import grad_jepa_loss
 from .predictor import GradJEPAPredictor
@@ -67,33 +64,28 @@ class Trainer(TrainerInterface):
         self.teacher_state_dict: Optional[Dict[str, Any]] = None
         self.predictor_state_dict: Optional[Dict[str, Any]] = None
         self.terms_state_dict: Optional[Dict[str, Any]] = None
+        # set from the ``backbone`` model hyperparameter in ``setup``
+        self.backbone: Backbone = BACKBONES["pet"]
 
     def setup(
         self, model_hypers: Dict[str, Any], dataset_info: DatasetInfo
-    ) -> MetatrainModel[PET, Scaler]:
+    ) -> MetatrainModel:
         if len(dataset_info.targets) > 0:
             raise ValueError(
                 "ssl_pretraining is label-free: set `targets: {}` in the "
                 f"dataset options (got targets {list(dataset_info.targets)})"
             )
-        if model_hypers["long_range"]["enable"]:
-            raise ValueError(
-                "ssl_pretraining does not support PET's long-range module yet"
-            )
-        if model_hypers["num_neighbors_adaptive"] is not None:
-            # masking removes neighbors, which would change the adaptive cutoffs
-            raise ValueError(
-                "ssl_pretraining does not support PET's adaptive cutoff yet"
-            )
-        pet_trainer = PETTrainer(get_default_hypers("pet")["training"])
-        return pet_trainer.setup(model_hypers, dataset_info)
+        # plain PET model hypers (without the ``backbone`` key) select PET
+        self.backbone = BACKBONES[model_hypers.get("backbone", "pet")]
+        self.backbone.validate(model_hypers)
+        return self.backbone.setup(model_hypers, dataset_info)
 
     def restart(
         self,
-        model: MetatrainModel[PET, Scaler],
+        model: MetatrainModel,
         dataset_info: DatasetInfo,
         model_hypers: Dict[str, Any],
-    ) -> MetatrainModel[PET, Scaler]:
+    ) -> MetatrainModel:
         raise ValueError(
             "ssl_pretraining runs are resumed with the `restart_from` trainer option, "
             "not with `mtt train --restart`"
@@ -101,14 +93,14 @@ class Trainer(TrainerInterface):
 
     def train(
         self,
-        model: MetatrainModel[PET, Scaler],
+        model: MetatrainModel,
         dtype: torch.dtype,
         devices: List[torch.device],
         train_datasets: List[Union[Dataset, torch.utils.data.Subset]],
         val_datasets: List[Union[Dataset, torch.utils.data.Subset]],
         checkpoint_dir: str,
     ) -> None:
-        assert dtype in PET.__supported_dtypes__
+        assert dtype in type(model.core).__supported_dtypes__
         if resolve_distributed(None):
             raise ValueError(
                 "ssl_pretraining does not support distributed training yet"
@@ -119,7 +111,7 @@ class Trainer(TrainerInterface):
         student = model.core
         if hypers["restart_from"] is not None:
             self._load_restart_state(hypers["restart_from"], model)
-        options = student.requested_neighbor_lists()[0]
+        options = self.backbone.neighbor_list_options(student)
         check_hypers(hypers, options.cutoff)
         terms = build_terms(hypers["objective"]["terms"])
         ROOT_LOGGER.info("Active loss terms: " + ", ".join(term.name for term in terms))
@@ -127,9 +119,8 @@ class Trainer(TrainerInterface):
         term_modules = torch.nn.ModuleDict(
             {term.name: term for term in terms if isinstance(term, torch.nn.Module)}
         )
-        feature_dim = student.num_readout_layers * (student.d_node + student.d_pet)
         predictor = GradJEPAPredictor(
-            feature_dim=feature_dim,
+            feature_dim=self.backbone.feature_dim(student),
             hidden_dim=hypers["predictor"]["hidden_dim"],
             probe_dim=hypers["predictor"]["probe_dim"],
             num_rbf=hypers["predictor"]["num_rbf"],
@@ -229,6 +220,7 @@ class Trainer(TrainerInterface):
                     options,
                     hypers,
                     generator,
+                    backbone=self.backbone,
                 )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, hypers["grad_clip_norm"])
@@ -260,6 +252,7 @@ class Trainer(TrainerInterface):
                     hypers,
                     val_generator,
                     with_rank=True,
+                    backbone=self.backbone,
                 )
                 _accumulate(val_metrics, {"loss": float(loss.detach()), **metrics})
                 n_val += 1

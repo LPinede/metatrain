@@ -4,16 +4,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
-from metatomic.torch import ModelOutput, NeighborListOptions, System
+from metatomic.torch import NeighborListOptions, System
 
+from .backbones import BACKBONES, Backbone
 from .masking import boundary_atoms, k_hop_ego_region, nl_ball_region
 from .views import bounded_noise, build_view, pair_vectors, random_rotations
 
 
 if TYPE_CHECKING:
     from .terms import Term
-
-FEATURE_OUTPUT = {"feature": ModelOutput(sample_kind="atom")}
 
 
 @dataclass
@@ -337,6 +336,7 @@ def build_step_data(
     hypers: Dict[str, Any],
     generator: torch.Generator,
     needs_gradients: bool,
+    backbone: Backbone = BACKBONES["pet"],
 ) -> StepData:
     """Build the views, encode them and run the predictor.
 
@@ -353,13 +353,14 @@ def build_step_data(
     :param hypers: The trainer hypers.
     :param generator: CPU random generator.
     :param needs_gradients: Whether some active term needs the probe gradients.
+    :param backbone: The adapter of the student and teacher backbone.
     :return: The step data.
     """
     views = build_views(
         systems, options, hypers, generator, position_gradients=needs_gradients
     )
 
-    student_features = student(views.student, FEATURE_OUTPUT)["feature"].block().values
+    student_features = backbone.features(student, views.student)
     probes = sample_probes(
         hypers["num_probes"],
         student_features.shape[1],
@@ -381,9 +382,7 @@ def build_step_data(
         student_gradients = torch.einsum(
             "pni,nij->pnj", student_gradients, views.rotations
         )
-        teacher_features = (
-            teacher(views.teacher, FEATURE_OUTPUT)["feature"].block().values
-        )
+        teacher_features = backbone.features(teacher, views.teacher)
         teacher_gradients = random_scalar_gradients(
             teacher_features,
             [s.positions for s in views.teacher],
@@ -392,9 +391,7 @@ def build_step_data(
         )
     else:
         with torch.no_grad():
-            teacher_features = (
-                teacher(views.teacher, FEATURE_OUTPUT)["feature"].block().values
-            )
+            teacher_features = backbone.features(teacher, views.teacher)
 
     types = torch.cat([s.types for s in systems])
     step = StepData(
@@ -436,6 +433,7 @@ def grad_jepa_loss(
     hypers: Dict[str, Any],
     generator: torch.Generator,
     with_rank: bool = False,
+    backbone: Backbone = BACKBONES["pet"],
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute the Grad-JEPA loss of one batch: the sum of the active terms.
 
@@ -450,6 +448,7 @@ def grad_jepa_loss(
     :param hypers: The trainer hypers.
     :param generator: CPU random generator.
     :param with_rank: Also report the RankMe of (at most 4096) student features.
+    :param backbone: The adapter of the student and teacher backbone.
     :return: The loss and a dictionary of scalar diagnostics.
     """
     if len(terms) == 0:
@@ -463,6 +462,7 @@ def grad_jepa_loss(
         hypers,
         generator,
         needs_gradients=any(term.needs_gradients for term in terms),
+        backbone=backbone,
     )
 
     losses = []

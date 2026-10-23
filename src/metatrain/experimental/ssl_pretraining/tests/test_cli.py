@@ -70,6 +70,8 @@ def test_pretrain_then_finetune(monkeypatch, tmp_path):
     )
     checkpoint = torch.load("pretrained.ckpt", weights_only=False)
     assert checkpoint["core"]["architecture_name"] == "pet"
+    # the ``backbone`` choice is not a PET hyperparameter
+    assert "backbone" not in checkpoint["core"]["model_data"]["model_hypers"]
     assert "grad_jepa" in checkpoint
     assert (tmp_path / "pretrained.pt").exists()
 

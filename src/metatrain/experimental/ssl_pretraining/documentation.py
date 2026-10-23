@@ -41,8 +41,16 @@ from typing import Annotated, Literal, Optional
 from pydantic import AfterValidator
 from typing_extensions import NotRequired, TypedDict
 
-from metatrain.pet.documentation import ModelHypers  # noqa: F401
+from metatrain.pet.documentation import ModelHypers as PETModelHypers
 from metatrain.utils.hypers import init_with_defaults
+
+
+class ModelHypers(PETModelHypers):
+    """The backbone choice; the other model hyperparameters are the backbone's."""
+
+    backbone: Literal["pet"] = "pet"
+    """The backbone to pretrain (through its adapter in ``backbones.py``). It is
+    not stored in the checkpoint, which stays a stock backbone checkpoint."""
 
 
 class NoiseHypers(TypedDict):

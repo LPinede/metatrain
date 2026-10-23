@@ -6,9 +6,9 @@ import ase.io
 import pytest
 import torch
 
+from metatrain.experimental.ssl_pretraining.backbones import FEATURE_OUTPUT
 from metatrain.experimental.ssl_pretraining.documentation import TrainerHypers
 from metatrain.experimental.ssl_pretraining.objective import (
-    FEATURE_OUTPUT,
     build_views,
     grad_jepa_loss,
     random_scalar_gradients,
