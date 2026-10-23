@@ -1,46 +1,24 @@
 import copy
-from typing import List
 
 import ase
 import ase.io
 import numpy as np
 import pytest
 import torch
-from metatomic.torch import NeighborListOptions
 
-from metatrain.experimental.ssl_pretraining.documentation import TrainerHypers
 from metatrain.experimental.ssl_pretraining.tests import (
     CARBON_PATH,
     QM9_PATH,
-    to_systems,
+    small_pet,
 )
-from metatrain.experimental.ssl_pretraining.views import (
-    get_skin_neighbor_list_transform,
-)
-from metatrain.utils.hypers import init_with_defaults
 
-
-ATOMIC_TYPES = [1, 6, 7, 8]
-# the neighbor list options of the small PET of ``ssl_pretraining/tests``
-OPTIONS = NeighborListOptions(cutoff=4.0, full_list=True, strict=False)
-
-
-def _batch(frames: List[ase.Atoms], dtype: torch.dtype):
-    """``(systems, options, hypers)``: the frames with the skin neighbor list, the
-    neighbor list options and the default trainer hypers (with the runtime
-    ``atomic_types`` key that the trainer adds)."""
-    # deep copy: ``init_with_defaults`` shares the mutable defaults
-    hypers = copy.deepcopy(init_with_defaults(TrainerHypers))
-    hypers["atomic_types"] = list(ATOMIC_TYPES)
-    transform = get_skin_neighbor_list_transform(OPTIONS, hypers["noise"]["skin"])
-    systems, _, _ = transform(to_systems(frames, dtype), {}, {})
-    return systems, OPTIONS, hypers
+from . import ATOMIC_TYPES, make_batch, make_step
 
 
 @pytest.fixture
 def small_batch():
     """3 small QM9 molecules (5, 4 and 3 atoms), float32."""
-    return _batch(ase.io.read(QM9_PATH, ":3"), torch.float32)
+    return make_batch(ase.io.read(QM9_PATH, ":3"), torch.float32)
 
 
 @pytest.fixture
@@ -50,7 +28,7 @@ def tiny_batch():
         ase.Atoms("H2", positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.74]]),
         ase.Atoms("CO", positions=[[0.0, 0.0, 0.0], [1.13, 0.0, 0.0]]),
     ]
-    return _batch(frames, torch.float32)
+    return make_batch(frames, torch.float32)
 
 
 @pytest.fixture
@@ -66,4 +44,50 @@ def large_batch():
     symbols = ["C" if i % 3 else "H" for i in range(len(grid))]
     molecule = ase.Atoms(symbols, positions=positions)
     crystal = ase.io.read(CARBON_PATH, 0).repeat((3, 3, 1))
-    return _batch([molecule, crystal], torch.float64)
+    return make_batch([molecule, crystal], torch.float64)
+
+
+@pytest.fixture
+def medium_batch():
+    """5 QM9 molecules of 8 to 14 atoms with H, C, N and O, float32."""
+    return make_batch(ase.io.read(QM9_PATH, "17:22"), torch.float32)
+
+
+@pytest.fixture
+def pet_core():
+    """A small PET core (float32, training mode) over H, C, N and O."""
+    torch.manual_seed(0)
+    return small_pet(ATOMIC_TYPES).train()
+
+
+@pytest.fixture
+def small_teacher(pet_core):
+    """A copy of ``pet_core`` set up as the EMA teacher (eval, no gradients)."""
+    teacher = copy.deepcopy(pet_core).eval()
+    for parameter in teacher.parameters():
+        parameter.requires_grad_(False)
+    return teacher
+
+
+@pytest.fixture
+def step_data(medium_batch, pet_core, small_teacher):
+    """High-order step data of ``medium_batch``, with both student branches."""
+    return make_step(medium_batch, pet_core, small_teacher, seed=1)
+
+
+@pytest.fixture
+def step_data_masked(medium_batch, pet_core, small_teacher):
+    """High-order step data of ``medium_batch``, mask-only branch."""
+    return make_step(medium_batch, pet_core, small_teacher, seed=0, p_def=0.0)
+
+
+@pytest.fixture
+def step_data_deformed(medium_batch, pet_core, small_teacher):
+    """High-order step data of ``medium_batch``, deform-only branch."""
+    return make_step(medium_batch, pet_core, small_teacher, seed=0, p_def=1.0)
+
+
+@pytest.fixture
+def tiny_step_data(tiny_batch, pet_core, small_teacher):
+    """High-order step data of two dimers (no boundary atom, no centre)."""
+    return make_step(tiny_batch, pet_core, small_teacher, seed=0)

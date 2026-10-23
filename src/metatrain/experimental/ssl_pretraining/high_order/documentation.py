@@ -1,4 +1,5 @@
-"""Hyperparameters of the high-order SSL method (``training.high_order``).
+"""Hyperparameters of the high-order SSL method (``training.high_order``) and of
+its loss terms (entries of ``training.objective.terms``).
 
 This module is the single source of the defaults. It must stay torch-free: the
 shared ``documentation.py`` imports it.
@@ -8,6 +9,8 @@ from typing import Annotated, Literal
 
 from pydantic import AfterValidator
 from typing_extensions import TypedDict
+
+from metatrain.utils.hypers import init_with_defaults
 
 
 def _probability(value: float) -> float:
@@ -111,3 +114,66 @@ class HighOrderHypers(TypedDict):
     VICReg)."""
     equivariant_vicreg_weight: NonNegativeFloat = 0.1
     """Weight of the equivariant VICReg term (with ``second_rotation``)."""
+
+
+def _three_distinct(value: list) -> list:
+    if len(value) != 3 or len(set(value)) != 3:
+        raise ValueError("must hold three distinct atomic types")
+    return value
+
+
+class AnchorHeadHypers(TypedDict):
+    """Form of the per-block heads of an analytic term."""
+
+    use_edges: bool = False
+    """Abbott et al.'s full per-block head (a node part plus a nonlinear map of each
+    edge token, summed over neighbours), instead of an MLP on the pooled per-atom
+    feature."""
+    channel_fraction: Annotated[float, AfterValidator(_fraction)] = 1.0
+    """Fraction of the node and edge token channels read by the heads."""
+
+
+class ResidualMultipoleTermHypers(TypedDict):
+    """``residual_multipole`` term (A): the residual multipoles of the boundary atoms,
+    one channel per element and radial function, orders 0 to ``l_max``."""
+
+    weight: NonNegativeFloat = 1.0
+    """Weight of the term."""
+    l_max: NonNegativeInt = 4
+    """Highest order of the targets."""
+    n_radial: PositiveInt = 6
+    """Number of radial functions."""
+    hidden: PositiveInt = 64
+    """Hidden width of the heads."""
+    floor_gamma: NonNegativeFloat = 0.1
+    """Weight of the per-batch variance floor of the l > 0 predictions (at 0.1
+    target standard deviations)."""
+    head: AnchorHeadHypers = init_with_defaults(AnchorHeadHypers)
+    """Form of the heads."""
+
+
+class DeformationJetsTermHypers(TypedDict):
+    """``deformation_jets`` term (B): the student displacement and the dilation,
+    local rotation and shear of the smooth field, at the atoms of deformed
+    structures."""
+
+    weight: NonNegativeFloat = 1.0
+    """Weight of the term."""
+    hidden: PositiveInt = 64
+    """Hidden width of the heads."""
+    head: AnchorHeadHypers = init_with_defaults(AnchorHeadHypers)
+    """Form of the heads."""
+
+
+class ChiralityTermHypers(TypedDict):
+    """``chirality`` term: the triple product of three element-channel dipoles, at
+    the visible atoms with at least 3 neighbours within the cutoff."""
+
+    weight: NonNegativeFloat = 0.1
+    """Weight of the term."""
+    hidden: PositiveInt = 64
+    """Hidden width of the head."""
+    channel_types: Annotated[list[int], AfterValidator(_three_distinct)] = [1, 6, 8]
+    """Atomic types of the three dipole channels."""
+    head: AnchorHeadHypers = init_with_defaults(AnchorHeadHypers)
+    """Form of the head."""

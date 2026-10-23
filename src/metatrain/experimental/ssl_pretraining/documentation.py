@@ -44,7 +44,12 @@ from typing_extensions import NotRequired, TypedDict
 from metatrain.pet.documentation import ModelHypers as PETModelHypers
 from metatrain.utils.hypers import init_with_defaults
 
-from .high_order.documentation import HighOrderHypers
+from .high_order.documentation import (
+    ChiralityTermHypers,
+    DeformationJetsTermHypers,
+    HighOrderHypers,
+    ResidualMultipoleTermHypers,
+)
 
 
 class ModelHypers(PETModelHypers):
@@ -162,6 +167,13 @@ class TermsHypers(TypedDict):
         init_with_defaults(GradientSpreadTermHypers)
     )
     """Gradient-spread hinge (needs the probe gradients)."""
+    residual_multipole: NotRequired[Optional[ResidualMultipoleTermHypers]] = None
+    """High-order method, term A: residual multipoles of the boundary atoms."""
+    deformation_jets: NotRequired[Optional[DeformationJetsTermHypers]] = None
+    """High-order method, term B: displacement and smooth-field gradient of the
+    deformed structures."""
+    chirality: NotRequired[Optional[ChiralityTermHypers]] = None
+    """High-order method: chirality of the visible atoms."""
 
 
 def _at_least_one_term(terms: dict) -> dict:

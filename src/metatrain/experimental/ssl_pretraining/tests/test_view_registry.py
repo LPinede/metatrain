@@ -187,7 +187,8 @@ def test_reserved_extras_keys_are_rejected(monkeypatch, key):
 
 
 def test_uses_prediction_flags():
-    flags = {name: TERMS[name].uses_prediction for name in TERMS}
+    # the Grad-JEPA terms (other SSL methods register theirs after them)
+    flags = {name: TERMS[name].uses_prediction for name in list(TERMS)[:4]}
     assert flags == {
         "latent": True,
         "gradient": True,
