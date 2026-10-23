@@ -85,7 +85,8 @@ class BlockNormalizer(torch.nn.Module):
     """Loss = mean squared error / EMA of the target variance (floor), per named block.
 
     The EMA variances (dynamic block names) are module extra state, so they are saved
-    and restored with ``state_dict``.
+    and restored with ``state_dict``. They are updated in training mode only; in eval
+    mode the stored variance is used (the unstored batch variance for an unseen name).
     """
 
     def __init__(self, momentum: float = 0.99, floor: float = 1e-6) -> None:
@@ -104,9 +105,13 @@ class BlockNormalizer(torch.nn.Module):
     ) -> torch.Tensor:
         with torch.no_grad():
             v = float(target.var(unbiased=False)) if target.numel() > 1 else 1.0
-            old = self.var.get(name, v)
-            self.var[name] = self.momentum * old + (1 - self.momentum) * v
-        return ((pred - target) ** 2).mean() / max(self.var[name], self.floor)
+            if self.training:
+                old = self.var.get(name, v)
+                self.var[name] = self.momentum * old + (1 - self.momentum) * v
+                var = self.var[name]
+            else:
+                var = self.var.get(name, v)
+        return ((pred - target) ** 2).mean() / max(var, self.floor)
 
     def scale(self, name: str) -> float:
         return max(self.var.get(name, 1.0), self.floor) ** 0.5

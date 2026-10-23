@@ -13,6 +13,8 @@ from metatrain.experimental.ssl_pretraining.high_order.irreps import (
     irrep_matrix,
 )
 
+from . import haar_o3
+
 
 def _inputs(n=5, k=7, dn=16, de=12):
     cutoff = torch.rand(n, k)
@@ -27,8 +29,9 @@ def test_block_head_shape_and_rejects_raw_tensors():
         head(torch.randn(5, 16))  # only HeadInputs (learned tokens) are accepted
 
 
-def test_padded_edges_contribute_nothing():
-    head = BlockHead((16, 12), 1, 2, 32, use_edges=True)
+@pytest.mark.parametrize("use_edges", [False, True])
+def test_padded_edges_contribute_nothing(use_edges):
+    head = BlockHead((16, 12), 1, 2, 32, use_edges=use_edges)
     x = _inputs()
     y = HeadInputs(x.node, x.edge.clone(), x.cutoff)
     y.edge[:, -2:] = 100 * torch.randn_like(y.edge[:, -2:])
@@ -59,17 +62,20 @@ def test_channel_fraction_ignores_other_channels(use_edges):
 
 
 def test_math_invariant_output_pays_full_target_energy():
-    """Anchor inequality (math only, no head): with an output independent of the
-    student rotation, the best constant is 0 since E[D] = 0, and it pays ||tau||^2."""
+    """Anchor inequality (math only, no head): an output Phi independent of the student
+    rotation pays E||D^T Phi - tau||^2 = ||Phi||^2 + ||tau||^2, since E[D] = 0; so the
+    best such output is 0 and pays ||tau||^2."""
     torch.manual_seed(0)
+    n = 4000
     tau = torch.randn(5, dtype=torch.float64)
-    rots = torch.linalg.qr(torch.randn(4000, 3, 3, dtype=torch.float64))[0]
-    d = irrep_matrix(rots, 2, 1)
-    mean_d = d.mean(0)
-    assert mean_d.abs().max() < 0.1  # Monte Carlo, 4000 draws
-    zeros = torch.zeros(4000, 5, 1, dtype=torch.float64)
-    loss_zero = ((back_map(zeros, d)[..., 0] - tau) ** 2).sum(-1).mean()
-    assert torch.allclose(loss_zero, (tau**2).sum(), rtol=1e-6)
+    phi = torch.randn(5, dtype=torch.float64)
+    d = irrep_matrix(haar_o3(n), 2, 1)
+    assert d.mean(0).abs().max() < 0.05
+    phi_n = phi.expand(n, 5)[..., None].contiguous()
+    loss = ((back_map(phi_n, d)[..., 0] - tau) ** 2).sum(-1).mean()
+    expected = (phi**2).sum() + (tau**2).sum()
+    assert torch.allclose(loss, expected, rtol=0.05)
+    assert loss > (tau**2).sum()
 
 
 def _pairs_distances(positions):
@@ -127,3 +133,15 @@ def test_batch_floor_zero_when_spread():
     pred = torch.randn(64, 3, 4)
     assert batch_variance_floor(pred, 0.1) == 0
     assert batch_variance_floor(torch.zeros(64, 3, 4), 0.1) > 0
+
+
+def test_normalizer_eval_mode_does_not_update():
+    norm = BlockNormalizer(momentum=0.5)
+    norm("a", torch.randn(10, 3), torch.randn(10, 3))
+    before = norm.state_dict()["_extra_state"]
+    norm.eval()
+    t = 5 * torch.randn(10, 3)
+    norm("a", torch.randn(10, 3), t)
+    norm("new", torch.randn(10, 3), t)  # unseen name: batch variance, not stored
+    assert norm.state_dict()["_extra_state"] == before
+    assert "new" not in norm.var
