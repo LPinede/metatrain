@@ -11,9 +11,9 @@ __capabilities__ = {
 }
 
 __authors__ = [
-    ("Lucas Pinède", "@lucaspinede"),
+    ("Lucas Pinède", "@LPinede"),
 ]
 
 __maintainers__ = [
-    ("Lucas Pinède", "@lucaspinede"),
+    ("Lucas Pinède", "@LPinede"),
 ]
