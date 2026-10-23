@@ -108,6 +108,7 @@ def test_projector_is_linear_so_it_cannot_create_orders():
     for proj in term.proj.values():
         assert isinstance(proj, torch.nn.Linear)
         assert proj.in_features == 14
+        assert proj.bias is None
     assert term.proj["l2p"].out_features == 5 * 4
     proper = EquivariantVicregTerm((8, 6), l_max=3, rotation_group="SO3")
     assert set(proper.proj) == {"l1p", "l2p", "l3p"}

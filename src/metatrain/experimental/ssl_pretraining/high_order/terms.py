@@ -467,8 +467,8 @@ class EquivariantVicregTerm(torch.nn.Module):
     """VICReg between two rotations of the same student input, per irrep block.
 
     For every block ``(l, sigma)``, ``1 <= l <= l_max`` (both parities with
-    ``rotation_group="O3"``), a linear map of the pooled student feature of each
-    view is mapped back to the teacher frame with its own rotation (``g_S`` and
+    ``rotation_group="O3"``), a linear map (no bias) of the pooled student feature
+    of each view is mapped back to the teacher frame with its own rotation (``g_S`` and
     ``g2 g_S``), over the visible atoms. The loss is ``weight * ramp *`` the mean
     over the blocks of ``agreement + hinge + 0.04 covariance``
     (:func:`equivariant_vicreg_block`). The projector is linear so that it cannot
@@ -517,7 +517,7 @@ class EquivariantVicregTerm(torch.nn.Module):
         self.proj = torch.nn.ModuleDict(
             {
                 self._key(l, sigma): torch.nn.Linear(
-                    dims[0] + dims[1], (2 * l + 1) * channels
+                    dims[0] + dims[1], (2 * l + 1) * channels, bias=False
                 )
                 for l, sigma in self.blocks
             }
