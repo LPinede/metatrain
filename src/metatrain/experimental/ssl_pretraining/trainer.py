@@ -291,8 +291,13 @@ class Trainer(TrainerInterface):
                         backbone=self.backbone,
                         step_fraction=step_fraction,
                     )
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(parameters, hypers["grad_clip_norm"])
+                # a total loss without grad (e.g. a frozen backbone and every term
+                # with parameters skipped on this step) has nothing to train: no
+                # backward, and the optimizer step leaves the parameters without
+                # gradients untouched (it keeps the scheduler order)
+                if loss.requires_grad:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(parameters, hypers["grad_clip_norm"])
                 optimizer.step()
                 lr_scheduler.step()
                 tau = tau_start + (tau_end - tau_start) * min(

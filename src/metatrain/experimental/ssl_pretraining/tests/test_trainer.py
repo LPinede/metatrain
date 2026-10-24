@@ -656,6 +656,35 @@ def test_freeze_backbone_trains_only_the_heads(tmp_path, monkeypatch):
     )
 
 
+class _SkippedTerm(_ScaleTerm):
+    """A term with a parameter that skips every step (a zero loss on the frozen
+    features, as a head term without sites)."""
+
+    name = "skipped"
+
+    def forward(self, step):
+        return step.student_features.sum() * 0.0, {}
+
+
+def test_steps_without_gradient_are_skipped(tmp_path, monkeypatch):
+    """With a frozen backbone, a step on which every term with parameters skips has
+    a total loss without grad: the step is skipped (no backward error), and the
+    run goes on."""
+    monkeypatch.setitem(terms_module.TERMS, "skipped", _SkippedTerm)
+    hypers = _trainer_hypers(num_epochs=1, freeze_backbone=True)
+    terms = hypers["objective"]["terms"]
+    terms.update(latent=None, gradient=None, gradient_spread=None)
+    terms["skipped"] = {"weight": 1.0}
+    trainer = Trainer(hypers)
+    model = trainer.setup(small_model_hypers(), INFO)
+    dataset = _dataset()
+    trainer.train(
+        model, torch.float32, [torch.device("cpu")], [dataset], [dataset], str(tmp_path)
+    )
+    assert trainer.step > 0 and trainer.epoch == 0
+    assert float(trainer.terms_state_dict["skipped.scale"]) == 1.0
+
+
 def test_freeze_backbone_needs_something_to_train(tmp_path):
     hypers = _trainer_hypers(freeze_backbone=True)
     vicreg = hypers["objective"]["terms"]["vicreg"]
