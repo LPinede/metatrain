@@ -985,9 +985,10 @@ class ActionResponseTerm(torch.nn.Module):
     over the centres of the batch, ``h_c`` the teacher latent of the clean
     structure: the pair mean, or ``h(x0)``), the same ratio for each block's
     predicted response (``rho_l{l}_{block}``), and the ``r2`` of the
-    probe-contracted prediction. Also ``n_centers`` (centres of the step) and
-    ``cap_fraction`` (mean over the structures with a centre of the fraction of
-    atoms whose ``u_T`` the skin cap scaled down).
+    probe-contracted prediction. Also ``skipped`` (1 on a step without a loss: no
+    centre, fewer than two, or no target variance), ``n_centers`` (centres of the
+    step) and ``cap_fraction`` (mean over the structures with a centre of the
+    fraction of atoms whose ``u_T`` the skin cap scaled down).
 
     .. code-block:: python
 
@@ -1157,6 +1158,9 @@ class ActionResponseTerm(torch.nn.Module):
         block = f"{self.name}/total"
         loss = _block_loss(self.norm, block, pred, target, diag)
         skipped = bool(diag[f"{block}/skipped"])
+        # reported on every step (also without centres), so that its epoch average
+        # is the fraction of steps without a loss
+        diag[f"{self.name}/skipped"] = diag[f"{block}/skipped"]
         # per-batch floors of the rotation and shear contributions, per probe and
         # relative to the target's spread, in units of the target scale
         floor = pred.new_zeros(())

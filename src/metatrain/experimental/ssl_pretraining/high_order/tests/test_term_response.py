@@ -117,6 +117,17 @@ def test_centre_count_and_cap_fraction_monitors(step_data, tiny_step_data):
     assert f"{NAME}/cap_fraction" not in diag
 
 
+def test_skipped_flag_is_reported_on_every_step(step_data, tiny_step_data):
+    """``action_response/skipped`` (1 when the term gives no loss) is reported with
+    and without centres: the trainer averages each key over the steps that report
+    it, so a flag reported only when skipping would always average to 1."""
+    _, diag = _term(step_data)(step_data)
+    assert float(diag[f"{NAME}/total/skipped"]) == 0.0
+    assert float(diag[f"{NAME}/skipped"]) == 0.0
+    _, diag = _term(tiny_step_data)(tiny_step_data)
+    assert float(diag[f"{NAME}/skipped"]) == 1.0
+
+
 def test_no_centers_gives_zero(tiny_step_data):
     assert tiny_step_data.extras["high_order"].centers.numel() == 0
     term = _term(tiny_step_data)
