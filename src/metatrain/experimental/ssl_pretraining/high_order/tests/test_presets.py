@@ -37,7 +37,10 @@ EXPECTED_TERMS = {
     "high_order_sigreg": ANALYTIC | {"sigreg"},
     "high_order_vicreg_averaged": ANALYTIC | {"vicreg_averaged"},
     "high_order_equivariant_vicreg": ANALYTIC | {"vicreg", "equivariant_vicreg"},
+    "invariant_jepa": {"rotation_conditioned_latent", "vicreg"},
 }
+# the presets whose terms read the antithetic teacher pair
+TEACHER_PAIR = {"invariant_jepa"}
 
 
 def _defaults() -> dict:
@@ -73,7 +76,7 @@ def test_preset_sets_the_expected_terms(preset):
     hypers = _hypers(preset)
     assert _active(hypers) == EXPECTED_TERMS[preset]
     assert hypers["views"]["builder"] == "high_order"
-    assert hypers["high_order"]["teacher_pair"] is False
+    assert hypers["high_order"]["teacher_pair"] is (preset in TEACHER_PAIR)
 
 
 @pytest.mark.parametrize("preset", IMPLEMENTED)
@@ -127,7 +130,7 @@ def test_apply_preset_keeps_the_other_base_keys():
 
 @pytest.mark.parametrize("preset", PENDING_PRESETS)
 def test_presets_with_teacher_terms_are_pending(preset):
-    with pytest.raises(NotImplementedError, match="H8"):
+    with pytest.raises(NotImplementedError, match="H9"):
         apply_preset(preset, _defaults())
 
 
@@ -164,6 +167,20 @@ def test_head_options_reach_the_heads(pet_core):
         assert all(not h.use_edges and h.dn == dn for h in heads(default[name]))
         assert all(h.use_edges and h.dn == dn for h in heads(edge[name]))
         assert all(h.dn == dn // 2 for h in heads(dedicated[name]))
+
+
+def test_invariant_jepa_is_the_order_zero_latent_on_masked_views(pet_core):
+    hypers = _hypers("invariant_jepa")
+    assert hypers["high_order"]["p_def"] == 0.0
+    assert hypers["high_order"]["second_rotation"] is False
+    latent = hypers["objective"]["terms"]["rotation_conditioned_latent"]
+    assert latent["l_max"] == 0
+    (term,) = [
+        t
+        for t in build_terms(hypers["objective"]["terms"], _context(pet_core))
+        if t.name == "rotation_conditioned_latent"
+    ]
+    assert term.head_keys == [(0, 1)] and term.active_l_max == 0
 
 
 @pytest.mark.parametrize(

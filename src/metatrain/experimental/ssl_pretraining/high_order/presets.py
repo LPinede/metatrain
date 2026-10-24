@@ -17,6 +17,12 @@ method are preset-level helpers that write the ``weight`` of each term:
 ``residual_multipole`` and ``deformation_jets`` and, times ``chirality_weight``, of
 ``chirality``. ``teacher_weight`` will do the same for the teacher terms.
 
+``invariant_jepa`` is the invariant-JEPA baseline of the method: the
+``rotation_conditioned_latent`` term at ``l_max: 0`` (an invariant prediction of
+the probe-contracted teacher latent, averaged over the antithetic teacher pair)
+with VICReg and no anchors, on the high-order views with ``p_def: 0`` (every
+structure masked as in Grad-JEPA, none deformed).
+
 .. code-block:: python
 
     import copy
@@ -57,6 +63,7 @@ from .documentation import (
     EquivariantVicregTermHypers,
     ResidualMultipoleTermHypers,
     RotationAveragedVicregTermHypers,
+    RotationConditionedLatentTermHypers,
 )
 
 
@@ -98,18 +105,25 @@ def analytic_terms(
 
 
 def _preset(
-    terms: Dict[str, Dict[str, Any]], second_rotation: bool = False
+    terms: Dict[str, Dict[str, Any]],
+    second_rotation: bool = False,
+    **high_order: Any,
 ) -> Dict[str, Any]:
-    """A preset on the high-order views with the teacher pair off and ``terms`` as
-    the active terms; every other term is disabled."""
+    """A preset on the high-order views with the teacher pair off (unless
+    ``high_order`` says otherwise) and ``terms`` as the active terms; every other
+    term is disabled. ``high_order`` overrides further view settings."""
     all_terms: Dict[str, Optional[Dict[str, Any]]] = {
         name: None for name in TermsHypers.__annotations__
     }
     all_terms.update(terms)
     return {
         "views": {"builder": "high_order"},
-        # no teacher term reads the antithetic teacher pair
-        "high_order": {"teacher_pair": False, "second_rotation": second_rotation},
+        # the anchors do not read the antithetic teacher pair
+        "high_order": {
+            "teacher_pair": False,
+            "second_rotation": second_rotation,
+            **high_order,
+        },
         "objective": {"terms": all_terms},
     }
 
@@ -150,6 +164,20 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         },
         second_rotation=True,
     ),
+    # the invariant JEPA: term C at order 0 (an invariant latent prediction of
+    # the antithetic teacher-pair mean) plus VICReg, no anchors, on the high-order
+    # views with every structure in the mask-only branch
+    "invariant_jepa": _preset(
+        {
+            "rotation_conditioned_latent": {
+                **_defaults(RotationConditionedLatentTermHypers),
+                "l_max": 0,
+            },
+            **_vicreg(),
+        },
+        teacher_pair=True,
+        p_def=0.0,
+    ),
 }
 """The implemented presets, by name."""
 
@@ -160,8 +188,8 @@ PENDING_PRESETS = (
     "high_order_shuffled_response",
     "high_order_so3",
 )
-"""The presets that need the teacher terms (rotation-conditioned latent and action
-response, tasks H8 and H9); :func:`apply_preset` rejects them until they exist."""
+"""The presets that need the action-response teacher term (task H9);
+:func:`apply_preset` rejects them until it exists."""
 
 
 def _merge(base: Dict[str, Any], override: Dict[str, Any]) -> None:
@@ -188,13 +216,13 @@ def apply_preset(name: str, base_hypers: Dict[str, Any]) -> Dict[str, Any]:
     :param name: The preset name (a key of :data:`PRESETS`).
     :param base_hypers: The trainer hypers to start from.
     :return: The trainer hypers with the preset applied.
-    :raises NotImplementedError: For a preset that needs the teacher terms.
+    :raises NotImplementedError: For a preset that needs the action-response term.
     :raises ValueError: For an unknown preset.
     """
     if name in PENDING_PRESETS:
         raise NotImplementedError(
-            f"preset '{name}' needs the teacher terms (tasks H8 and H9), which do "
-            "not exist yet"
+            f"preset '{name}' needs the teacher terms (the action-response term, "
+            "task H9, does not exist yet)"
         )
     if name not in PRESETS:
         raise ValueError(
