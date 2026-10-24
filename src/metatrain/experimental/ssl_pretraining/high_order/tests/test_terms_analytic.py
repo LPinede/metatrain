@@ -40,6 +40,7 @@ from . import (
     make_batch,
     make_step,
     mirrored,
+    randomize_heads,
     with_hidden_atom_moved,
 )
 
@@ -54,17 +55,19 @@ def _dims(step):
 
 
 def _multipole(step, l_max=2, n_radial=4, floor_gamma=0.1):
-    return ResidualMultipoleTerm(
-        _dims(step), l_max, n_radial, N_SPECIES, CUTOFF, 32, 1.0, floor_gamma
+    return randomize_heads(
+        ResidualMultipoleTerm(
+            _dims(step), l_max, n_radial, N_SPECIES, CUTOFF, 32, 1.0, floor_gamma
+        )
     )
 
 
 def _jets(step):
-    return DeformationJetTerm(_dims(step), 32, 1.0)
+    return randomize_heads(DeformationJetTerm(_dims(step), 32, 1.0))
 
 
 def _chirality(step, cutoff=CUTOFF):
-    return ChiralityTerm(_dims(step), 32, 1.0, (1, 6, 8), cutoff)
+    return randomize_heads(ChiralityTerm(_dims(step), 32, 1.0, (1, 6, 8), cutoff))
 
 
 def _all_terms(step):
@@ -444,6 +447,20 @@ def test_jets_leave_out_structures_with_fewer_than_three_atoms(pet_core, small_t
         targets["displacement"][:, :, 0],
         ho.u_student[ho.structure_index == 2][:, list(XYZ_TO_L1)],
     )
+
+
+def test_start_up_normalized_loss_is_near_one(step_data):
+    """Fresh heads predict 0, so each block's normalized MSE starts at
+    ``mean(t^2) / var(t)`` (1 for a centred target), not at the squared ratio of the
+    head and target scales."""
+    term = DeformationJetTerm(_dims(step_data), 32, 1.0)
+    targets = term.teacher_frame_targets(step_data)
+    _, diag = term(step_data)
+    expected = [t.pow(2).mean() / t.var(unbiased=False) for t in targets.values()]
+    torch.testing.assert_close(
+        diag["deformation_jets/loss"], torch.stack(expected).mean()
+    )
+    assert float(diag["deformation_jets/loss"]) < 5.0
 
 
 def test_isolated_deformed_atom_is_skipped(pet_core, small_teacher):

@@ -84,3 +84,16 @@ def mirrored(batch, student, teacher, seed: int = 0, **over) -> StepData:
 
     with mock.patch.object(ho_views, "random_rotations", negated):
         return make_step(batch, student, teacher, seed, **over)
+
+
+def randomize_heads(module: torch.nn.Module) -> torch.nn.Module:
+    """Give the last layer of every ``BlockHead`` in ``module`` PyTorch's default
+    random init (heads start at zero), for tests of the structure of non-zero
+    predictions. Returns ``module``."""
+    from metatrain.experimental.ssl_pretraining.high_order.heads import BlockHead
+
+    for head in module.modules():
+        if isinstance(head, BlockHead):
+            for net in [head.node_net] + ([head.edge_net] if head.use_edges else []):
+                net[-1].reset_parameters()
+    return module

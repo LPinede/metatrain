@@ -13,7 +13,7 @@ from metatrain.experimental.ssl_pretraining.high_order.irreps import (
     irrep_matrix,
 )
 
-from . import haar_o3
+from . import haar_o3, randomize_heads
 
 
 def _inputs(n=5, k=7, dn=16, de=12):
@@ -30,6 +30,20 @@ def test_block_head_shape_and_rejects_raw_tensors():
 
 
 @pytest.mark.parametrize("use_edges", [False, True])
+def test_block_head_starts_at_zero_and_trains(use_edges):
+    """The last linear layer starts at zero: a fresh head predicts 0, so a
+    normalized MSE starts near 1 instead of (head scale / target scale)^2; the last
+    layer still gets a gradient."""
+    head = BlockHead((16, 12), 1, 2, 32, use_edges=use_edges)
+    out = head(_inputs())
+    assert torch.equal(out, torch.zeros_like(out))
+    (out - 1.0).pow(2).sum().backward()
+    nets = [head.node_net] + ([head.edge_net] if use_edges else [])
+    for net in nets:
+        assert net[-1].weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("use_edges", [False, True])
 def test_padded_edges_contribute_nothing(use_edges):
     head = BlockHead((16, 12), 1, 2, 32, use_edges=use_edges)
     x = _inputs()
@@ -42,12 +56,12 @@ def test_edge_head_is_nonlinear_per_edge():
     """Abbott's form is not a function of the pooled edge sum alone: two neighbour
     sets with the same cutoff-weighted sum give different outputs."""
     torch.manual_seed(0)
-    head = BlockHead((4, 3), 1, 1, 16, use_edges=True)
+    head = randomize_heads(BlockHead((4, 3), 1, 1, 16, use_edges=True))
     node = torch.zeros(1, 4)
     a = HeadInputs(node, torch.tensor([[[1.0, 0, 0], [-1.0, 0, 0]]]), torch.ones(1, 2))
     b = HeadInputs(node, torch.zeros(1, 2, 3), torch.ones(1, 2))
     assert not torch.allclose(head(a), head(b))
-    pooled = BlockHead((4, 3), 1, 1, 16)  # default: pooled feature
+    pooled = randomize_heads(BlockHead((4, 3), 1, 1, 16))  # default: pooled feature
     assert torch.allclose(pooled(a), pooled(b))  # sees only the sum
 
 

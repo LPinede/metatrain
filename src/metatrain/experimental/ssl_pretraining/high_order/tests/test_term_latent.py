@@ -26,7 +26,7 @@ from metatrain.experimental.ssl_pretraining.tests import CARBON_PATH, small_pet
 from metatrain.utils.architectures import check_architecture_options, get_default_hypers
 from metatrain.utils.hypers import init_with_defaults
 
-from . import ATOMIC_TYPES, haar_o3, make_batch, make_step
+from . import ATOMIC_TYPES, haar_o3, make_batch, make_step, randomize_heads
 
 
 NAME = "rotation_conditioned_latent"
@@ -35,14 +35,16 @@ CUTOFF = 4.0
 
 def _term(step, l_max=4, **kwargs):
     kwargs.setdefault("warmup_fraction", 0.0)
-    return RotationConditionedLatentTerm(
-        step.extras["student_tokens"].dims,
-        step.teacher_features.shape[1],
-        l_max,
-        32,
-        CUTOFF,
-        1.0,
-        **kwargs,
+    return randomize_heads(
+        RotationConditionedLatentTerm(
+            step.extras["student_tokens"].dims,
+            step.teacher_features.shape[1],
+            l_max,
+            32,
+            CUTOFF,
+            1.0,
+            **kwargs,
+        )
     )
 
 

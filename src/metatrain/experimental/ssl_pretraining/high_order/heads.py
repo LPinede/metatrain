@@ -25,7 +25,8 @@ class BlockHead(torch.nn.Module):
     edge token before the neighbour sum.
 
     Accepts only ``HeadInputs`` (learned tokens and scalar cutoff factors), so no raw
-    geometric vector can enter a head (the head rule).
+    geometric vector can enter a head (the head rule). The last linear layer starts at
+    zero, so a fresh head predicts 0.
     """
 
     def __init__(
@@ -47,6 +48,11 @@ class BlockHead(torch.nn.Module):
             self.edge_net = _mlp(self.de, hidden, width)
         else:
             self.node_net = _mlp(self.dn + self.de, hidden, width)
+        # a fresh head predicts 0: a normalized MSE starts near 1 instead of at the
+        # squared ratio of the head and target scales
+        for net in [self.node_net] + ([self.edge_net] if use_edges else []):
+            torch.nn.init.zeros_(net[-1].weight)
+            torch.nn.init.zeros_(net[-1].bias)
 
     def forward(self, x: HeadInputs) -> torch.Tensor:
         if not isinstance(x, HeadInputs):

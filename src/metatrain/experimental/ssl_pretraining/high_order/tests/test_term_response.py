@@ -33,7 +33,7 @@ from metatrain.experimental.ssl_pretraining.trainer import check_hypers
 from metatrain.utils.architectures import check_architecture_options, get_default_hypers
 from metatrain.utils.hypers import init_with_defaults
 
-from . import ATOMIC_TYPES, haar_o3, make_batch
+from . import ATOMIC_TYPES, haar_o3, make_batch, randomize_heads
 
 
 NAME = "action_response"
@@ -42,14 +42,16 @@ EPS = 0.05
 
 def _term(step, **kwargs):
     kwargs.setdefault("warmup_fraction", 0.0)
-    return ActionResponseTerm(
-        step.extras["student_tokens"].dims,
-        step.teacher_features.shape[1],
-        32,
-        1.0,
-        EPS,
-        rank=8,
-        **kwargs,
+    return randomize_heads(
+        ActionResponseTerm(
+            step.extras["student_tokens"].dims,
+            step.teacher_features.shape[1],
+            32,
+            1.0,
+            EPS,
+            rank=8,
+            **kwargs,
+        )
     )
 
 
