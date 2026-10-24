@@ -160,6 +160,12 @@ def _remove_rigid_rotation(
     return field - centered @ skew.T, gradient - skew
 
 
+MIN_FIELD_RMS = 1e-5
+"""Centred RMS displacement of a smooth field of unit nominal amplitude (as the
+views generate it) at or below which the field counts as uniform over the atoms,
+up to rounding: no displacement to rescale in :func:`_student_displacement`."""
+
+
 def _student_displacement(
     field: torch.Tensor,
     gradient: torch.Tensor,
@@ -172,14 +178,17 @@ def _student_displacement(
     max_norm`` at every atom and ``grad_smooth`` the exact gradient of ``u_smooth``.
 
     The smooth field is centred and rescaled (with its gradient) to a root-mean-square
-    displacement ``rms`` over the atoms of the structure. The iid part is centred and
+    displacement ``rms`` over the atoms of the structure; a field uniform over the
+    atoms (a single atom, a one-atom periodic cell, or a reciprocal-lattice field
+    that takes the same value on every atom of the cell) has no centred
+    displacement and gives a zero smooth part and gradient. The iid part is centred and
     capped per atom at ``b = min(3 iid_sigma, max_norm / 2)``; the smooth field is
     then scaled by a single safety factor ``s <= 1`` per structure so that its
     largest norm is at most ``max_norm - b`` (``s = 1`` when it already is). No
     per-atom cap acts on the smooth part, so it stays a smooth field with a known
     gradient.
 
-    :param field: Smooth field, shape ``(n_atoms, 3)``.
+    :param field: Smooth field of unit nominal amplitude, shape ``(n_atoms, 3)``.
     :param gradient: Its gradient, shape ``(n_atoms, 3, 3)``.
     :param iid: Raw iid noise, shape ``(n_atoms, 3)``.
     :param iid_sigma: Standard deviation of the iid noise.
@@ -192,8 +201,11 @@ def _student_displacement(
     bound = min(3 * iid_sigma, max_norm / 2)
     iid = cap_norm(iid - iid.mean(dim=0), bound)
     smooth = field - field.mean(dim=0)
-    current = smooth.pow(2).sum(dim=-1).mean().sqrt().clamp(min=1e-12)
-    normalise = rms / current
+    current = smooth.pow(2).sum(dim=-1).mean().sqrt()
+    # a field uniform over the atoms (a single atom) has no centred displacement:
+    # nothing to rescale, so no smooth part and no gradient (not ``rms / 0``)
+    uniform = current <= MIN_FIELD_RMS
+    normalise = torch.where(uniform, 0.0, rms / current.clamp(min=MIN_FIELD_RMS))
     smooth, gradient = normalise * smooth, normalise * gradient
     largest = smooth.norm(dim=-1).max().clamp(min=1e-12)
     scale = torch.clamp((max_norm - bound) / largest, max=1.0)

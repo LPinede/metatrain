@@ -56,7 +56,9 @@ class HighOrderHypers(TypedDict):
     field_amplitude: PositiveFloat = 0.05
     """Root-mean-square displacement (length units) of the smooth random field of
     the deform-only branch, per structure, over its atoms (after centring and, for
-    non-periodic structures, removal of the rigid rotation). If the displacement
+    non-periodic structures, removal of the rigid rotation); a structure on whose
+    atoms the field is uniform (a single atom, some small periodic cells) gets no
+    smooth displacement and a zero gradient. If the displacement
     would exceed ``noise.skin / 2`` on some atom, the whole field is scaled down
     for that structure; the factor is logged as ``deformation_jets/field_scale``."""
     wavelength: PositiveFloat = 8.0

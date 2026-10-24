@@ -455,6 +455,53 @@ def test_student_displacement_of_a_zero_field_is_finite():
     assert float(scale) == 1.0
 
 
+@pytest.mark.parametrize("n_atoms", [1, 2])
+def test_student_displacement_without_centred_displacement_has_no_gradient(n_atoms):
+    """A unit-amplitude field that is uniform over the atoms up to rounding (the
+    views pass it centred) has no centred displacement to rescale to the requested
+    RMS: its smooth part and gradient are zero, not the raw gradient inflated by
+    ``rms / 0``."""
+    field = 1e-9 * torch.randn(n_atoms, 3, dtype=torch.float64)
+    gradient = torch.randn(n_atoms, 3, 3, dtype=torch.float64)
+    u_smooth, grad, u_student, scale = ho_views._student_displacement(
+        field, gradient, torch.zeros(n_atoms, 3, dtype=torch.float64), 0.03, 0.25, 0.05
+    )
+    assert torch.equal(u_smooth, torch.zeros_like(u_smooth))
+    assert torch.equal(grad, torch.zeros_like(grad))
+    assert float(scale) == 1.0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_structures_without_smooth_displacement_have_zero_jet_targets(dtype):
+    """Structures of MAD on whose atoms the smooth field is uniform, on the
+    deform-only branch: a monomer, a one-atom periodic cell and a CsCl-type cell
+    (a reciprocal-lattice wave with even index sum takes the same value on both
+    atoms; all six do with probability 1/64). No smooth displacement, so a zero
+    smooth-field gradient (it was the raw gradient times ``rms / ~1e-15``, ~1e11)."""
+    frames = [
+        ase.Atoms("O", positions=[[0.0, 0.0, 0.0]]),
+        ase.Atoms("C", positions=[[0.0, 0.0, 0.0]], cell=[2.5] * 3, pbc=True),
+    ]
+    for seed in range(4):
+        _, _, v = _views(make_batch(frames, dtype), seed=seed, p_def=1.0)
+        ho = v.extras["high_order"]
+        assert bool(ho.branch_deformed.all())
+        assert torch.equal(ho.grad_smooth, torch.zeros_like(ho.grad_smooth))
+        assert torch.equal(ho.u_smooth, torch.zeros_like(ho.u_smooth))
+    # CsCl: the seeds whose six waves all have an even index sum
+    cscl = ase.Atoms(
+        "CO", scaled_positions=[[0, 0, 0], [0.5] * 3], cell=[3.1] * 3, pbc=True
+    )
+    uniform = 0
+    for seed in range(400):
+        _, _, v = _views(make_batch([cscl], dtype), seed=seed, p_def=1.0)
+        ho = v.extras["high_order"]
+        if bool(ho.branch_deformed.all()) and float(ho.u_smooth.abs().max()) == 0.0:
+            uniform += 1
+            assert torch.equal(ho.grad_smooth, torch.zeros_like(ho.grad_smooth))
+    assert uniform > 0
+
+
 @pytest.mark.parametrize("rms", [0.02, 0.05])
 def test_smooth_field_has_the_requested_rms(large_batch, rms):
     """The smooth field of every deformed structure (molecule and periodic cell) has
