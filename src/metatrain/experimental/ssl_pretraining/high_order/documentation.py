@@ -181,13 +181,15 @@ class RotationAveragedVicregTermHypers(TypedDict):
 
 
 class RotationConditionedLatentTermHypers(TypedDict):
-    """``rotation_conditioned_latent`` term (C): predicts the probe-contracted
-    teacher latent of the clean structure (the mean over the antithetic teacher
-    pair, else the clean teacher) at the latent targets, as
-    ``sum_{l <= L, sigma} <D^(l,sigma)(g_S), Phi^(l,sigma)>`` with per-block heads
-    on the student tokens. The number of probes is the trainer's ``num_probes``; the
-    pseudo heads exist only with ``rotation_group: O3``. ``l_max: 0`` is the
-    invariant JEPA.
+    """``rotation_conditioned_latent`` term (C): predicts the teacher latent of the
+    clean structure (the mean over the antithetic teacher pair, else the clean
+    teacher) at the latent targets, as
+    ``sum_{(l, sigma)} <D^(l,sigma)(g_S), A^(l,sigma) W^(l,sigma)>`` with per-block
+    heads ``A`` on the student tokens and low-rank maps ``W`` to the latent, and
+    compares it with the teacher after the contraction of both with the step's
+    probes. The pseudo blocks (``(0, -)`` included, active from order 1) exist only
+    with ``rotation_group: O3``; with ``rotation_group: none`` the order stays 0.
+    ``l_max: 0`` is the invariant JEPA.
 
     Order curriculum: ``L = 0`` while the training progress is below
     ``warmup_fraction``, then ``min(2, l_max)``; after the warm-up, ``L`` grows by
@@ -201,6 +203,8 @@ class RotationConditionedLatentTermHypers(TypedDict):
     """Highest order of the curriculum."""
     hidden: PositiveInt = 64
     """Hidden width of the heads and of the invariant context of masked atoms."""
+    rank: PositiveInt = 64
+    """Rank of each block's map to the teacher latent."""
     promote_threshold: PositiveFloat = 0.2
     """Norm ratio of the highest active order above which it counts towards a
     promotion."""

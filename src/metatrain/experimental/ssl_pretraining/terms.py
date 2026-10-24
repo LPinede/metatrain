@@ -62,6 +62,7 @@ class TermContext:
     atomic_types: List[int]  # the atomic types of the dataset
     num_probes: int  # the ``num_probes`` trainer hyperparameter
     rotation_group: str = "O3"  # the ``rotation_group`` trainer hyperparameter
+    feature_dim: Optional[int] = None  # dimension of the per-atom features
 
 
 TERMS: Dict[str, Callable[..., Term]] = {}

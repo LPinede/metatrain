@@ -122,6 +122,7 @@ class Trainer(TrainerInterface):
             atomic_types=list(model.dataset_info.atomic_types),
             num_probes=hypers["num_probes"],
             rotation_group=hypers["rotation_group"],
+            feature_dim=self.backbone.feature_dim(student),
         )
         terms = build_terms(hypers["objective"]["terms"], context)
         ROOT_LOGGER.info("Active loss terms: " + ", ".join(term.name for term in terms))

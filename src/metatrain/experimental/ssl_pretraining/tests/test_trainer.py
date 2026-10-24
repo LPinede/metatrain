@@ -564,6 +564,9 @@ def test_trainer_calls_the_validation_epoch_hook(tmp_path, monkeypatch):
     assert all(epoch["epoch_hook/value"] == 2.0 for epoch in term.epochs)
     assert all("loss" in epoch for epoch in term.epochs)
     assert term.context.rotation_group == "O3"
+    core = model.core
+    n = core.num_readout_layers
+    assert term.context.feature_dim == n * (core.d_node + core.d_pet)
 
 
 def test_training_without_prediction_terms_builds_no_predictor(tmp_path):

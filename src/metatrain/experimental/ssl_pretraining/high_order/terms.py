@@ -9,9 +9,9 @@ The analytic anchors:
 
 the teacher term:
 
-- ``rotation_conditioned_latent`` (C): the probe-contracted teacher latent,
-  predicted through the student rotation, with an order curriculum (order 0: the
-  invariant JEPA);
+- ``rotation_conditioned_latent`` (C): the teacher latent, predicted through the
+  student rotation and compared after a probe contraction, with an order
+  curriculum (order 0: the invariant JEPA);
 
 and the collapse regularizers that need the second student rotation
 (``high_order.second_rotation``):
@@ -26,10 +26,11 @@ student tokens, maps them back to the teacher frame with ``D^(l,sigma)(g_S)^T``
 (det(g_S) for pseudo blocks), and compares them with exact teacher-frame targets.
 A term returns ``weight`` times the mean over its blocks of the normalized MSE
 (:class:`BlockNormalizer`). Term C instead contracts ``D^(l,sigma)(g_S)`` with
-its head outputs to predict a teacher-frame scalar per probe.
+its head outputs to predict the teacher latent, compared after the contraction of
+both sides with the step's probes.
 """
 
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -641,6 +642,13 @@ class RotationAveragedVicregTerm:
         }
 
 
+def _spread(x: torch.Tensor) -> torch.Tensor:
+    """The norm of ``x`` centred over the batch (per column)."""
+    if x.shape[0] == 0:
+        return x.new_zeros(())
+    return (x - x.mean(dim=0)).norm()
+
+
 CONTEXT_RBF = 16
 """Number of radial functions of the invariant context of masked atoms."""
 
@@ -649,20 +657,32 @@ PROMOTION_EPOCHS = 3
 
 
 class RotationConditionedLatentTerm(torch.nn.Module):
-    """Term C: the probe-contracted teacher latent of the clean structure, predicted
-    through the student rotation.
+    """Term C: the teacher latent of the clean structure, predicted through the
+    student rotation and compared after the probe contraction.
 
-    The target at the latent targets (``Views.latent_targets``) is
-    ``t_p = v_p . (h+ + h-) / 2`` with the antithetic teacher pair, or
-    ``t_p = v_p . h(x0)`` with the clean teacher (one-sided views), where ``v_p`` are
-    the step's probes. The prediction is
-    ``sum_{l <= L, sigma} <D^(l,sigma)(g_S), Phi^(l,sigma)_p>``, where ``Phi`` is a
-    per-block head output reshaped to ``(n, 2l+1, 2l+1, num_probes)``. Its optimum
-    is the order-``(l, sigma)`` Fourier coefficient of the teacher latent over the
-    orientations of the student input; a teacher without orientation content makes
-    the zero ``l > 0`` output optimal (C is neutral). ``(0, -)`` is left out, so
-    that ``L = 0`` is the invariant JEPA; the pseudo blocks ``l >= 1`` exist only
-    with ``rotation_group="O3"``.
+    The teacher latent at the latent targets (``Views.latent_targets``) is
+    ``h = (h+ + h-) / 2`` with the antithetic teacher pair, or ``h = h(x0)`` with
+    the clean teacher (one-sided views). The prediction of the latent itself is
+    ``h_hat = sum_{active (l, sigma)} <D^(l,sigma)(g_S), Phi^(l,sigma)>`` with
+    ``Phi^(l,sigma) = A^(l,sigma) W^(l,sigma)``: ``A`` is a per-block head output
+    ``(n, 2l+1, 2l+1, rank)`` on the student tokens and ``W`` a learnable
+    ``(rank, feature_dim)`` matrix (low rank). Both sides are contracted with the
+    step's probes ``v_p`` (redrawn every step): the loss compares
+    ``t_hat_p = v_p . h_hat`` with ``t_p = v_p . h``, and ``v_p`` is contracted into
+    ``W`` first (cost ``rank * feature_dim * num_probes``). Because the heads predict
+    ``h`` and not one output per probe, they can learn although the probes change
+    at every step.
+
+    The optimum of each block is the order-``(l, sigma)`` Fourier coefficient of
+    the teacher latent over the orientations of the student input; a teacher
+    without orientation content makes the zero output of every block but
+    ``(0, +)`` optimal (C is neutral).
+
+    Blocks: ``(0, +)`` is always active, so ``L = 0`` is the invariant JEPA. With
+    ``rotation_group="O3"`` the pseudo blocks ``(l, -)`` exist too, ``(0, -)``
+    included; ``(0, -)`` is active whenever the order is at least 1. With
+    ``rotation_group="none"`` the student is not rotated, so the order is forced to
+    0 (only the ``(0, +)`` head exists).
 
     At masked atoms, the node tokens are replaced by an :class:`InvariantContext`
     over the clean pairs from the masked atom to its visible neighbours (their
@@ -675,30 +695,32 @@ class RotationConditionedLatentTerm(torch.nn.Module):
     next order after :data:`PROMOTION_EPOCHS` consecutive validation epochs with the
     norm ratio of order ``active_l_max`` above ``promote_threshold``; it never
     promotes during the warm-up. Evaluation uses the order of the last training
-    step.
+    step. The norm ratio of an order is the batch spread (per-probe standard
+    deviations, combined) of its contribution over that of the target.
 
     The loss is ``weight * (L_C + floor_gamma * sum_blocks floor)``: ``L_C`` is the
-    normalized MSE of the prediction (:func:`_block_loss`, skipped without target
+    normalized MSE of ``t_hat`` (:func:`_block_loss`, skipped without target
     variance) and each active ``l > 0`` block contribution gets the per-batch
     variance floor at :data:`FLOOR_LEVEL` target standard deviations (per probe, in
-    units of the target scale).
+    units of the target scale); ``(0, -)`` gets no floor.
 
     .. code-block:: python
 
-        term = RotationConditionedLatentTerm((256, 256), 4, 2, 64, 4.5, 1.0)
+        term = RotationConditionedLatentTerm((256, 256), 512, 4, 64, 4.5, 1.0)
         loss, diagnostics = term(step)
         term.maybe_promote(validation_diagnostics)
 
     :param dims: ``(Dn, De)`` token dimensions.
+    :param feature_dim: Dimension of the teacher latent.
     :param l_max: Highest order of the curriculum (0: the invariant JEPA).
-    :param num_probes: Number of probes of the step (``num_probes``).
     :param hidden: Hidden width of the heads and of the invariant context.
     :param cutoff: Cutoff of the invariant context's radial functions.
     :param weight: Weight of the term.
+    :param rank: Rank of each block's map to the teacher latent.
     :param promote_threshold: Norm ratio of the highest active order that counts
         towards a promotion.
-    :param rotation_group: ``"O3"`` (proper and pseudo blocks) or ``"SO3"`` /
-        ``"none"`` (proper blocks only).
+    :param rotation_group: ``"O3"`` (proper and pseudo blocks), ``"SO3"`` (proper
+        blocks only) or ``"none"`` (order 0 only).
     :param floor_gamma: Weight of the floors of the ``l > 0`` block contributions.
     :param warmup_fraction: Fraction of the steps with ``L = 0``.
     :param head_kwargs: Keyword arguments of every :class:`BlockHead`.
@@ -711,11 +733,12 @@ class RotationConditionedLatentTerm(torch.nn.Module):
     def __init__(
         self,
         dims: Tuple[int, int],
+        feature_dim: int,
         l_max: int,
-        num_probes: int,
         hidden: int,
         cutoff: float,
         weight: float,
+        rank: int = 64,
         promote_threshold: float = 0.2,
         rotation_group: str = "O3",
         floor_gamma: float = 0.1,
@@ -725,22 +748,32 @@ class RotationConditionedLatentTerm(torch.nn.Module):
         super().__init__()
         if rotation_group not in ("O3", "SO3", "none"):
             raise ValueError(f"unknown rotation group '{rotation_group}'")
-        self.l_max, self.num_probes, self.weight = l_max, num_probes, weight
+        if rotation_group == "none":
+            l_max = 0  # without student rotations, D(g_S) is the identity
+        self.l_max, self.rank, self.weight = l_max, rank, weight
         self.promote_threshold, self.floor_gamma = promote_threshold, floor_gamma
         self.warmup_fraction = warmup_fraction
         self.required_targets: dict = {}
         sigmas = (1, -1) if rotation_group == "O3" else (1,)
+        # (0, -) only if some order >= 1 can become active
         self.head_keys = [
             (l, sigma)
             for l in range(l_max + 1)
             for sigma in sigmas
-            if not (l == 0 and sigma == -1)
+            if not (l == 0 and sigma == -1 and l_max == 0)
         ]
         self.heads = torch.nn.ModuleDict(
             {
                 self.key(l, sigma): BlockHead(
-                    dims, l, (2 * l + 1) * num_probes, hidden, **(head_kwargs or {})
+                    dims, l, (2 * l + 1) * rank, hidden, **(head_kwargs or {})
                 )
+                for l, sigma in self.head_keys
+            }
+        )
+        # W^(l,sigma) as the weight (feature_dim, rank) of a bias-free linear map
+        self.maps = torch.nn.ModuleDict(
+            {
+                self.key(l, sigma): torch.nn.Linear(rank, feature_dim, bias=False)
                 for l, sigma in self.head_keys
             }
         )
@@ -766,9 +799,11 @@ class RotationConditionedLatentTerm(torch.nn.Module):
         cls, hypers: Dict[str, Any], context: TermContext
     ) -> "RotationConditionedLatentTerm":
         """Build the term from its hypers and the run's context."""
+        if context.feature_dim is None:
+            raise ValueError(f"the '{cls.name}' term needs `context.feature_dim`")
         return cls(
             dims=context.dims,
-            num_probes=context.num_probes,
+            feature_dim=context.feature_dim,
             cutoff=context.cutoff,
             rotation_group=context.rotation_group,
             **_head_kwargs(hypers),
@@ -809,25 +844,37 @@ class RotationConditionedLatentTerm(torch.nn.Module):
         """The highest order used now (0 during the warm-up)."""
         return self.active_l_max if bool(self.warmed_up) else 0
 
+    def active_blocks(self) -> List[Tuple[int, int]]:
+        """The blocks used now: ``(0, +)``, and every block up to the order (with
+        ``(0, -)``) once the order is at least 1."""
+        order = self.order()
+        return [
+            (l, sigma)
+            for l, sigma in self.head_keys
+            if l <= order and (sigma == 1 or order >= 1)
+        ]
+
     def contributions(self, step: StepData) -> Dict[Tuple[int, int], torch.Tensor]:
-        """The contribution ``<D^(l,sigma)(g_S), Phi^(l,sigma)>`` of each active
+        """The probe contraction ``v_p . <D^(l,sigma)(g_S), A W>`` of each active
         block, ``(n_sites, num_probes)``."""
         ho: HighOrderExtras = step.extras["high_order"]
         atoms = step.views.latent_targets
         inputs = self.head_inputs(step).select(atoms)
         rotations = ho.rotations[atoms]
         out = {}
-        for l, sigma in self.head_keys:
-            if l > self.order():
-                continue
-            phi = self.heads[self.key(l, sigma)](inputs)
-            phi = phi.reshape(-1, 2 * l + 1, 2 * l + 1, self.num_probes)
-            matrices = irrep_matrix(rotations, l, sigma).to(phi)
-            out[(l, sigma)] = torch.einsum("nmq,nmqp->np", matrices, phi)
+        for l, sigma in self.active_blocks():
+            name = self.key(l, sigma)
+            a = self.heads[name](inputs).reshape(-1, 2 * l + 1, 2 * l + 1, self.rank)
+            matrices = irrep_matrix(rotations, l, sigma).to(a)
+            # <D, A> per rank channel, then W v_p (probes contracted into W first)
+            rotated = torch.einsum("nmq,nmqk->nk", matrices, a)
+            probed = step.probes.to(a) @ self.maps[name].weight  # (P, rank)
+            out[(l, sigma)] = rotated @ probed.T
         return out
 
     def predict(self, step: StepData) -> torch.Tensor:
-        """The prediction at the latent targets, ``(n_sites, num_probes)``."""
+        """The probe-contracted prediction at the latent targets,
+        ``(n_sites, num_probes)``."""
         return torch.stack(list(self.contributions(step).values())).sum(0)
 
     def forward(self, step: StepData) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -851,11 +898,19 @@ class RotationConditionedLatentTerm(torch.nn.Module):
                     floor = floor + batch_variance_floor(part / scale, level)
         loss = loss + self.floor_gamma * floor
         with torch.no_grad():
-            target_norm = target.norm().clamp(min=1e-12)
+            # spread over the batch (per-probe centring) relative to the target's
+            target_spread = _spread(target).clamp(min=1e-12)
             for l in range(self.order() + 1):
-                order_part = sum(p for (k, _), p in parts.items() if k == l)
+                # both parities, except (0, -), which is reported apart
+                order_part = [
+                    p for (k, s), p in parts.items() if k == l and (k, s) != (0, -1)
+                ]
                 diag[f"{self.name}/l{l}/norm_ratio"] = (
-                    torch.as_tensor(order_part).norm() / target_norm
+                    _spread(torch.stack(order_part).sum(0)) / target_spread
+                )
+            if (0, -1) in parts:
+                diag[f"{self.name}/l0_pseudo/norm_ratio"] = (
+                    _spread(parts[(0, -1)]) / target_spread
                 )
         diag[f"{self.name}/floor"] = floor.detach()
         diag[f"{self.name}/loss"] = loss.detach()

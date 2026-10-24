@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 import types
 import warnings
 
@@ -11,7 +12,6 @@ from metatrain.experimental.ssl_pretraining.backbones import HeadInputs
 from metatrain.experimental.ssl_pretraining.high_order import documentation
 from metatrain.experimental.ssl_pretraining.high_order.irreps import (
     irrep_matrix,
-    wigner_d,
 )
 from metatrain.experimental.ssl_pretraining.high_order.terms import (
     RotationConditionedLatentTerm,
@@ -37,8 +37,8 @@ def _term(step, l_max=4, **kwargs):
     kwargs.setdefault("warmup_fraction", 0.0)
     return RotationConditionedLatentTerm(
         step.extras["student_tokens"].dims,
+        step.teacher_features.shape[1],
         l_max,
-        step.probes.shape[0],
         32,
         CUTOFF,
         1.0,
@@ -51,11 +51,13 @@ def test_l0_is_plain_invariant_latent(step_data):
     assert term.head_keys == [(0, 1)]
     loss, diag = term(step_data)
     assert torch.isfinite(loss) and f"{NAME}/total/rmse" in diag
-    # the prediction is the l=0 head on the head inputs, whatever the rotations
+    # the prediction is the l=0 head on the head inputs, mapped to the latent and
+    # contracted with the probes, whatever the rotations
     pred = term.predict(step_data)
     atoms = step_data.views.latent_targets
     inputs = term.head_inputs(step_data).select(atoms)
-    expected = term.heads["l0p"](inputs)[:, 0]
+    latent = term.maps["l0p"](term.heads["l0p"](inputs)[:, 0])
+    expected = latent @ step_data.probes.T
     torch.testing.assert_close(pred, expected)
     ho = step_data.extras["high_order"]
     flipped = copy.copy(step_data)
@@ -110,34 +112,48 @@ def test_masked_atoms_read_the_invariant_context_only(step_data_masked):
     assert len(pairs) <= int(masked[ho.pair_index[:, 0]].sum())
 
 
-def test_math_orbit_coefficient_l1():
-    """Least squares through ``<D(g), Phi>`` with an invariant student feature
-    recovers the l=1 content of a target that rotates as a vector."""
+@pytest.mark.parametrize("l, sigma", [(0, -1), (1, 1), (1, -1), (2, 1)])
+def test_math_orbit_coefficient(l, sigma):
+    """The least-squares coefficients of a target on the entries of ``D^(l,sigma)``
+    (with the other blocks) are ``d E[D t]`` (Peter-Weyl, the optimum of term C)."""
     torch.manual_seed(0)
-    n = 20000
+    n = 100000
     rots = haar_o3(n)
-    target_dir = torch.tensor([0.3, -0.5, 0.8], dtype=torch.float64)
-    target = torch.einsum("nba,b->na", rots, target_dir)[:, 0]  # (g^T t)_x
-    d = wigner_d(rots, 1).reshape(n, 9)
-    coef = torch.linalg.lstsq(d, target[:, None]).solution
-    pred = d @ coef
-    assert ((pred[:, 0] - target) ** 2).mean() < 1e-10
+    blocks = [(0, 1), (0, -1), (1, 1), (1, -1), (2, 1)]
+    features = {b: irrep_matrix(rots, *b).reshape(n, -1) for b in blocks}
+    coefficients = {
+        b: torch.randn(features[b].shape[1], dtype=rots.dtype) for b in blocks
+    }
+    target = sum(features[b] @ coefficients[b] for b in blocks)
+    design = torch.cat([features[b] for b in blocks], dim=1)
+    solution = torch.linalg.lstsq(design, target[:, None]).solution[:, 0]
+    start = sum(features[b].shape[1] for b in blocks[: blocks.index((l, sigma))])
+    fitted = solution[start : start + (2 * l + 1) ** 2]
+    torch.testing.assert_close(fitted, coefficients[(l, sigma)])
+    d = 2 * l + 1
+    monte_carlo = d * (features[(l, sigma)] * target[:, None]).mean(0)
+    torch.testing.assert_close(monte_carlo, fitted, atol=0.1, rtol=0.0)
 
 
-def _synthetic_step(n, num_probes, sigma, seed=0):
+DIM = 6
+
+
+def _synthetic_step(n, content, seed=0):
     """Invariant student tokens (identical for every atom), Haar rotations, and a
-    teacher feature whose probe contraction is ``c_p det(g)^((1-sigma)/2) (g^T a)_x``:
-    l=1 content of parity ``sigma``, no l=0 content."""
+    teacher latent ``h = s(g) w`` with an orientation signal ``s`` without l=0
+    proper content: ``"l1p"`` is ``(g^T a)_x`` (order 1, proper), ``"l1m"`` is
+    ``det(g) (g^T a)_x`` (order 1, pseudo) and ``"l0m"`` is ``det(g)``."""
     gen = torch.Generator().manual_seed(seed)
     torch.manual_seed(seed)
     rotations = haar_o3(n)
     a = torch.randn(3, generator=gen, dtype=torch.float64)
-    signal = torch.einsum("nba,b->na", rotations, a)[:, 0]
-    if sigma == -1:
-        signal = signal * torch.linalg.det(rotations)
-    dim = 6
-    w = torch.randn(dim, generator=gen, dtype=torch.float64)
-    probes = (torch.randint(0, 2, (num_probes, dim), generator=gen) * 2 - 1).to(w)
+    det = torch.linalg.det(rotations)
+    signal = {
+        "l1p": torch.einsum("nba,b->na", rotations, a)[:, 0],
+        "l1m": det * torch.einsum("nba,b->na", rotations, a)[:, 0],
+        "l0m": det,
+    }[content]
+    w = torch.randn(DIM, generator=gen, dtype=torch.float64)
     teacher = signal[:, None] * w[None, :]
     tokens = HeadInputs(
         node=torch.ones(n, 4, dtype=torch.float64),
@@ -155,8 +171,8 @@ def _synthetic_step(n, num_probes, sigma, seed=0):
     )
     return StepData(
         views=views,
-        probes=probes,
-        student_features=torch.zeros(n, dim, dtype=torch.float64),
+        probes=_probes(gen),
+        student_features=torch.zeros(n, DIM, dtype=torch.float64),
         teacher_features=teacher,
         student_gradients=None,
         teacher_gradients=None,
@@ -171,55 +187,72 @@ def _synthetic_step(n, num_probes, sigma, seed=0):
     )
 
 
+def _probes(gen, num_probes=2):
+    signs = torch.randint(0, 2, (num_probes, DIM), generator=gen) * 2 - 1
+    return signs.to(torch.float64) / DIM**0.5
+
+
 def _fit(term, step, n_steps=300):
+    """Train ``term`` on ``step`` with new probes at every step; the normalized
+    error on fresh probes."""
+    gen = torch.Generator().manual_seed(1)
     term = term.to(torch.float64).train()
     optimizer = torch.optim.Adam(term.parameters(), lr=1e-2)
     for _ in range(n_steps):
         optimizer.zero_grad()
-        loss, _ = term(step)
+        loss, _ = term(dataclasses.replace(step, probes=_probes(gen)))
         loss.backward()
         optimizer.step()
     term.eval()
+    step = dataclasses.replace(step, probes=_probes(gen, 8))
     with torch.no_grad():
-        _, diag = term(step)
-    return float(diag[f"{NAME}/total/rmse"]) ** 2 / float(
-        term.teacher_frame_targets(step).var()
-    )
+        error = (term.predict(step) - term.teacher_frame_targets(step)).pow(2).mean()
+    return float(error / term.teacher_frame_targets(step).var())
 
 
-@pytest.mark.parametrize("sigma", [1, -1])
-def test_rotation_conditioned_heads_capture_the_l1_content(sigma):
-    step = _synthetic_step(2000, 3, sigma)
+@pytest.mark.parametrize("content", ["l1p", "l1m", "l0m"])
+def test_heads_learn_the_orientation_content_with_probes_redrawn(content):
+    step = _synthetic_step(2000, content)
 
     def term(l_max, group):
         torch.manual_seed(0)
         return RotationConditionedLatentTerm(
-            (4, 4), l_max, 3, 16, CUTOFF, 1.0, rotation_group=group, floor_gamma=0.0
+            (4, 4),
+            DIM,
+            l_max,
+            16,
+            CUTOFF,
+            1.0,
+            rank=4,
+            rotation_group=group,
+            floor_gamma=0.0,
+            warmup_fraction=0.0,
         )
 
     # the invariant JEPA cannot predict orientation content (C is neutral)
     assert _fit(term(0, "O3"), step) > 0.9
-    # order 1 of the right parity captures it
+    # order 1 (with the (0, -) block) captures it, although the probes change
     assert _fit(term(1, "O3"), step) < 0.05
-    if sigma == -1:
+    if content != "l1p":
         # without the pseudo heads, the pseudo content stays unexplained
         assert _fit(term(1, "SO3"), step) > 0.9
 
 
 def test_prediction_contracts_the_rotation_with_the_head_output(step_data):
     term = _term(step_data, l_max=2)
+    assert term.active_blocks() == term.head_keys
     atoms = step_data.views.latent_targets
     inputs = term.head_inputs(step_data).select(atoms)
     rotations = step_data.extras["high_order"].rotations[atoms]
-    p = step_data.probes.shape[0]
-    expected = 0.0
+    latent = 0.0
     for l, sigma in term.head_keys:
-        phi = term.heads[term.key(l, sigma)](inputs)
-        phi = phi.reshape(-1, 2 * l + 1, 2 * l + 1, p)
-        expected = expected + torch.einsum(
-            "nmq,nmqp->np", irrep_matrix(rotations, l, sigma), phi
+        name = term.key(l, sigma)
+        a = term.heads[name](inputs).reshape(-1, 2 * l + 1, 2 * l + 1, term.rank)
+        phi = torch.einsum("nmqk,dk->nmqd", a, term.maps[name].weight)
+        latent = latent + torch.einsum(
+            "nmq,nmqd->nd", irrep_matrix(rotations, l, sigma), phi
         )
-    torch.testing.assert_close(term.predict(step_data), expected)
+    torch.testing.assert_close(term.predict(step_data), latent @ step_data.probes.T)
 
 
 def test_curriculum_holds_order_zero_during_the_warm_up(step_data):
@@ -230,6 +263,8 @@ def test_curriculum_holds_order_zero_during_the_warm_up(step_data):
     _, diag = term(step)
     assert float(diag[f"{NAME}/active_l_max"]) == 0
     assert f"{NAME}/l1/norm_ratio" not in diag
+    assert f"{NAME}/l0_pseudo/norm_ratio" not in diag
+    assert term.active_blocks() == [(0, 1)]
     # validation (step fraction 1) keeps the order of the training steps
     term.eval()
     _, diag = term(step_data)
@@ -243,6 +278,7 @@ def test_curriculum_holds_order_zero_during_the_warm_up(step_data):
     _, diag = term(step)
     assert float(diag[f"{NAME}/active_l_max"]) == 2
     assert f"{NAME}/l2/norm_ratio" in diag and f"{NAME}/l3/norm_ratio" not in diag
+    assert f"{NAME}/l0_pseudo/norm_ratio" in diag
 
 
 def test_promotion_requires_three_epochs(step_data):
@@ -291,16 +327,47 @@ def test_low_l_max_starts_at_l_max(step_data):
     assert _term(step_data, l_max=0).active_l_max == 0
 
 
-@pytest.mark.parametrize("group", ["SO3", "none"])
-def test_no_pseudo_heads_without_inversions(step_data, group):
-    term = _term(step_data, l_max=2, rotation_group=group)
-    assert all(sigma == 1 for (_, sigma) in term.head_keys)
-    assert [l for l, _ in term.head_keys] == [0, 1, 2]
+def test_no_pseudo_heads_without_inversions(step_data):
+    term = _term(step_data, l_max=2, rotation_group="SO3")
+    assert term.head_keys == [(0, 1), (1, 1), (2, 1)]
 
 
 def test_pseudo_heads_with_inversions(step_data):
     term = _term(step_data, l_max=2)
-    assert term.head_keys == [(0, 1), (1, 1), (1, -1), (2, 1), (2, -1)]
+    assert term.head_keys == [(0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)]
+    # the invariant JEPA has no (0, -) block
+    assert _term(step_data, l_max=0).head_keys == [(0, 1)]
+
+
+def test_order_stays_zero_without_student_rotations(step_data):
+    term = _term(step_data, l_max=4, rotation_group="none")
+    assert term.head_keys == [(0, 1)] and term.active_l_max == 0
+    _, diag = term(step_data)
+    assert float(diag[f"{NAME}/active_l_max"]) == 0
+    for _ in range(3):
+        term.maybe_promote({f"{NAME}/l0/norm_ratio": 0.9})
+    assert term.active_l_max == 0
+
+
+def test_norm_ratio_is_the_spread_ratio(step_data):
+    term = _term(step_data, l_max=1).eval()
+    _, diag = term(step_data)
+    parts = term.contributions(step_data)
+    target = term.teacher_frame_targets(step_data)
+
+    def spread(x):
+        return (x - x.mean(0)).norm()
+
+    order_1 = parts[(1, 1)] + parts[(1, -1)]
+    torch.testing.assert_close(
+        diag[f"{NAME}/l1/norm_ratio"], spread(order_1) / spread(target)
+    )
+    torch.testing.assert_close(
+        diag[f"{NAME}/l0/norm_ratio"], spread(parts[(0, 1)]) / spread(target)
+    )
+    torch.testing.assert_close(
+        diag[f"{NAME}/l0_pseudo/norm_ratio"], spread(parts[(0, -1)]) / spread(target)
+    )
 
 
 def test_loss_is_weighted_normalized_mse_plus_floors(step_data):
@@ -335,24 +402,30 @@ def _defaults():
     )
 
 
-def test_from_hypers_takes_probes_and_rotation_group_from_the_context():
+def test_from_hypers_takes_the_feature_dim_and_rotation_group_from_the_context():
     context = TermContext(
         dims=(24, 20),
         cutoff=3.5,
         atomic_types=[1, 8],
         num_probes=5,
         rotation_group="SO3",
+        feature_dim=44,
     )
     hypers = _defaults()
     hypers["head"]["channel_fraction"] = 0.5
+    hypers["rank"] = 7
     (term,) = build_terms({NAME: hypers}, context)
-    assert term.num_probes == 5 and term.l_max == 4 and term.active_l_max == 2
+    assert term.l_max == 4 and term.active_l_max == 2
     assert all(sigma == 1 for _, sigma in term.head_keys)
-    assert term.heads["l1p"].dn == 12 and term.heads["l1p"].n_out == 3 * 5
+    assert term.heads["l1p"].dn == 12 and term.heads["l1p"].n_out == 3 * 7
+    assert term.maps["l1p"].weight.shape == (44, 7)
     assert term.context.cutoff == 3.5
     assert not term.needs_gradients and not term.uses_prediction
     assert term.required_targets == {}
     assert TERMS[NAME] is RotationConditionedLatentTerm
+    context.feature_dim = None
+    with pytest.raises(ValueError, match="feature_dim"):
+        build_terms({NAME: hypers}, context)
 
 
 def test_default_hypers_disable_the_term_and_validate_when_enabled():
@@ -363,6 +436,7 @@ def test_default_hypers_disable_the_term_and_validate_when_enabled():
     assert terms[NAME]["l_max"] == 4
     assert terms[NAME]["promote_threshold"] == 0.2
     assert terms[NAME]["warmup_fraction"] == 0.05
+    assert terms[NAME]["rank"] == 64
     check_architecture_options(name="experimental.ssl_pretraining", options=options)
 
 
@@ -386,6 +460,7 @@ def test_term_contract():
         cutoff=CUTOFF,
         atomic_types=ATOMIC_TYPES,
         num_probes=2,
+        feature_dim=student.num_readout_layers * (student.d_node + student.d_pet),
     )
     (term,) = build_terms({NAME: _defaults()}, context)
     term = term.to(torch.float64)

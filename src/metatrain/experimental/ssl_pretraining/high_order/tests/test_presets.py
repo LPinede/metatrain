@@ -63,6 +63,7 @@ def _context(core) -> TermContext:
         cutoff=4.0,
         atomic_types=[1, 6, 7, 8],
         num_probes=2,
+        feature_dim=n * (core.d_node + core.d_pet),
     )
 
 

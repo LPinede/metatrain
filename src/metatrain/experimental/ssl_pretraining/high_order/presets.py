@@ -21,7 +21,10 @@ method are preset-level helpers that write the ``weight`` of each term:
 ``rotation_conditioned_latent`` term at ``l_max: 0`` (an invariant prediction of
 the probe-contracted teacher latent, averaged over the antithetic teacher pair)
 with VICReg and no anchors, on the high-order views with ``p_def: 0`` (every
-structure masked as in Grad-JEPA, none deformed).
+structure masked as in Grad-JEPA, none deformed). Its latent targets are those of
+the high-order views: the masked atoms reachable from a visible neighbour *and
+every visible atom* (unlike Grad-JEPA's ``latent`` term, which weighs the
+unmasked structures with ``unmasked_scale``).
 
 .. code-block:: python
 
