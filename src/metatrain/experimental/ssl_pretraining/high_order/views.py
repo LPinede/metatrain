@@ -20,7 +20,10 @@
 Displacements are bounded by ``noise.skin / 2`` per atom, separately for ``u_S`` and
 ``u_T``, so the skin neighbor list stays exact: ``u_T`` is capped per atom, and
 ``u_S`` is bounded by scaling its smooth part per structure and capping its iid
-part (so that ``grad_smooth`` stays the exact gradient of ``u_smooth``). All random
+part (so that ``grad_smooth`` stays the exact gradient of ``u_smooth``). The smooth
+field is first normalised to a per-structure root-mean-square displacement
+``high_order.field_amplitude`` (after centring and the rigid-rotation projection);
+the safety factor is ``HighOrderExtras.field_scale``. All random
 numbers are drawn on CPU from the step generator, then moved to the device and dtype
 of the positions.
 """
@@ -60,6 +63,9 @@ class HighOrderExtras:
     branch_deformed: torch.Tensor  # (n_structures,) bool: deform-only branch
     rotations: torch.Tensor  # (n_atoms, 3, 3) student rotation of each atom
     u_student: torch.Tensor  # (n_atoms, 3) total student displacement u_S
+    # (n_structures,) safety factor <= 1 applied to the smooth field of the
+    # structure (1 without deformation or when no scaling was needed)
+    field_scale: torch.Tensor
     grad_smooth: torch.Tensor  # (n_atoms, 3, 3) d(u_smooth)_a / dx_b at each atom
     u_smooth: torch.Tensor  # (n_atoms, 3) smooth part of u_S (u_S - u_smooth: iid)
     pair_index: torch.Tensor  # (n_pairs, 2) clean pairs within the cutoff
@@ -157,30 +163,39 @@ def _student_displacement(
     iid: torch.Tensor,
     iid_sigma: float,
     max_norm: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rms: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bounded student displacement ``u_S = u_smooth + iid``, with ``|u_S| <=
     max_norm`` at every atom and ``grad_smooth`` the exact gradient of ``u_smooth``.
 
-    The iid part is centred and capped per atom at ``b = min(3 iid_sigma,
-    max_norm / 2)``; the centred smooth field (and its gradient) is scaled by a
-    single factor per structure so that its largest norm is at most
-    ``max_norm - b``. No per-atom cap acts on the smooth part, so it stays a smooth
-    field with a known gradient.
+    The smooth field is centred and rescaled (with its gradient) to a root-mean-square
+    displacement ``rms`` over the atoms of the structure. The iid part is centred and
+    capped per atom at ``b = min(3 iid_sigma, max_norm / 2)``; the smooth field is
+    then scaled by a single safety factor ``s <= 1`` per structure so that its
+    largest norm is at most ``max_norm - b`` (``s = 1`` when it already is). No
+    per-atom cap acts on the smooth part, so it stays a smooth field with a known
+    gradient.
 
     :param field: Smooth field, shape ``(n_atoms, 3)``.
     :param gradient: Its gradient, shape ``(n_atoms, 3, 3)``.
     :param iid: Raw iid noise, shape ``(n_atoms, 3)``.
     :param iid_sigma: Standard deviation of the iid noise.
     :param max_norm: Maximum displacement norm per atom (``skin / 2``).
-    :return: ``u_smooth``, ``grad_smooth`` and ``u_student``.
+    :param rms: Requested RMS displacement of the smooth field, before the safety
+        scaling.
+    :return: ``u_smooth``, ``grad_smooth``, ``u_student`` and the safety factor ``s``
+        (a scalar).
     """
     bound = min(3 * iid_sigma, max_norm / 2)
     iid = cap_norm(iid - iid.mean(dim=0), bound)
     smooth = field - field.mean(dim=0)
+    current = smooth.pow(2).sum(dim=-1).mean().sqrt().clamp(min=1e-12)
+    normalise = rms / current
+    smooth, gradient = normalise * smooth, normalise * gradient
     largest = smooth.norm(dim=-1).max().clamp(min=1e-12)
     scale = torch.clamp((max_norm - bound) / largest, max=1.0)
     u_smooth = scale * smooth
-    return u_smooth, scale * gradient, u_smooth + iid
+    return u_smooth, scale * gradient, u_smooth + iid, scale
 
 
 def _select_centers(
@@ -321,7 +336,7 @@ def build_high_order_views(
                 field = periodic_field_with_gradient(
                     positions,
                     cell,
-                    ho["field_amplitude"],
+                    1.0,
                     ho["max_wave_index"],
                     generator,
                 )
@@ -330,7 +345,7 @@ def build_high_order_views(
                     positions,
                     *smooth_field_with_gradient(
                         positions,
-                        ho["field_amplitude"],
+                        1.0,
                         ho["wavelength"],
                         ho["n_waves"],
                         generator,
@@ -339,12 +354,15 @@ def build_high_order_views(
             iid = ho["iid_sigma"] * torch.randn(
                 n_atoms, 3, generator=generator, dtype=torch.float64
             )
-            u_smooth, grad_smooth, u_student = _student_displacement(
+            # the fields are generated with unit nominal amplitude and rescaled to
+            # the requested RMS after centring and rigid-rotation removal
+            u_smooth, grad_smooth, u_student, field_scale = _student_displacement(
                 field[0],
                 field[1],
                 iid.to(device=device, dtype=dtype),
                 ho["iid_sigma"],
                 max_norm,
+                ho["field_amplitude"],
             )
         else:
             # region sampling loops over atoms: run it on CPU
@@ -358,6 +376,7 @@ def build_high_order_views(
             u_smooth = zeros
             grad_smooth = torch.zeros(n_atoms, 3, 3, dtype=dtype, device=device)
             u_student = zeros
+            field_scale = torch.ones((), dtype=dtype, device=device)
         masked = masked.to(device)
 
         # student view: displaced, rotated, pairs touching masked atoms removed
@@ -431,6 +450,7 @@ def build_high_order_views(
             branch_deformed=torch.tensor([deformed], device=device),
             rotations=rotation.expand(n_atoms, 3, 3),
             u_student=u_student,
+            field_scale=field_scale.reshape(1),
             grad_smooth=grad_smooth,
             u_smooth=u_smooth,
             pair_index=pairs[close] + offset,

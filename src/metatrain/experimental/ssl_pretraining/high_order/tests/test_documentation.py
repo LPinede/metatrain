@@ -12,7 +12,7 @@ NAME = "experimental.ssl_pretraining"
 
 DEFAULTS = {
     "p_def": 0.5,
-    "field_amplitude": 0.15,
+    "field_amplitude": 0.05,
     "wavelength": 8.0,
     "n_waves": 6,
     "max_wave_index": 2,

@@ -53,9 +53,12 @@ class HighOrderHypers(TypedDict):
     p_def: Probability = 0.5
     """Probability that a structure takes the deform-only student branch (else the
     mask-only branch, masked as in Grad-JEPA through ``mask``)."""
-    field_amplitude: PositiveFloat = 0.15
-    """Amplitude (length units) of the smooth random displacement field of the
-    deform-only branch."""
+    field_amplitude: PositiveFloat = 0.05
+    """Root-mean-square displacement (length units) of the smooth random field of
+    the deform-only branch, per structure, over its atoms (after centring and, for
+    non-periodic structures, removal of the rigid rotation). If the displacement
+    would exceed ``noise.skin / 2`` on some atom, the whole field is scaled down
+    for that structure; the factor is logged as ``deformation_jets/field_scale``."""
     wavelength: PositiveFloat = 8.0
     """Wavelength (length units) of the plane waves of the smooth field of
     non-periodic structures."""

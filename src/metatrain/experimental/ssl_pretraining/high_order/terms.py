@@ -295,6 +295,7 @@ class DeformationJetTerm(torch.nn.Module):
 
     def forward(self, step: StepData) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         diag: Dict[str, torch.Tensor] = {}
+        ho: HighOrderExtras = step.extras["high_order"]
         preds, targets = self.predict(step), self.teacher_frame_targets(step)
         losses = [
             _block_loss(
@@ -304,6 +305,11 @@ class DeformationJetTerm(torch.nn.Module):
         ]
         loss = torch.stack(losses).mean()
         diag[f"{self.name}/loss"] = loss.detach()
+        # mean safety factor of the smooth field over the deformed structures
+        scales = ho.field_scale[ho.branch_deformed]
+        diag[f"{self.name}/field_scale"] = (
+            scales.mean().detach() if len(scales) else loss.new_ones(())
+        )
         return self.weight * loss, diag
 
 

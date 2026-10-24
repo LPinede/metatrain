@@ -2,6 +2,7 @@ import copy
 from dataclasses import fields
 
 import ase.io
+import numpy as np
 import pytest
 import torch
 from metatomic.torch import System
@@ -21,6 +22,8 @@ from metatrain.experimental.ssl_pretraining.objective import (
 )
 from metatrain.experimental.ssl_pretraining.tests import QM9_PATH
 from metatrain.experimental.ssl_pretraining.views import pair_vectors
+
+from . import make_batch
 
 
 def _views(batch, seed=0, position_gradients=True, **over):
@@ -278,6 +281,7 @@ def test_extras_shapes_and_consistency(large_batch):
         "u_student": ((n_atoms, 3), dtype),
         "grad_smooth": ((n_atoms, 3, 3), dtype),
         "u_smooth": ((n_atoms, 3), dtype),
+        "field_scale": ((n_structures,), dtype),
         "pair_index": ((n_pairs, 2), torch.long),
         "clean_vectors": ((n_pairs, 3), dtype),
         "observed_vectors": ((n_pairs, 3), dtype),
@@ -414,24 +418,89 @@ def test_student_displacement_is_smooth_plus_bounded_iid():
     gradient = torch.randn(30, 3, 3, dtype=torch.float64, generator=generator)
     iid = 0.05 * torch.randn(30, 3, dtype=torch.float64, generator=generator)
     max_norm, sigma = 0.25, 0.05
-    u_smooth, grad_smooth, u_student = ho_views._student_displacement(
-        field, gradient, iid, sigma, max_norm
+    smooth = field - field.mean(0)
+    rms = 0.4
+    u_smooth, grad_smooth, u_student, field_scale = ho_views._student_displacement(
+        field, gradient, iid, sigma, max_norm, rms
     )
     bound = min(3 * sigma, max_norm / 2)
     expected_iid = ho_views.cap_norm(iid - iid.mean(0), bound)
     assert torch.equal(u_student, u_smooth + expected_iid)
-    smooth = field - field.mean(0)
-    scale = (max_norm - bound) / smooth.norm(dim=-1).max()
+    normalise = rms / smooth.pow(2).sum(-1).mean().sqrt()
+    scale = (max_norm - bound) / (normalise * smooth.norm(dim=-1).max())
     assert scale < 1  # the bound acts on this field
-    torch.testing.assert_close(u_smooth, scale * smooth)
-    torch.testing.assert_close(grad_smooth, scale * gradient)
+    torch.testing.assert_close(field_scale, scale)
+    torch.testing.assert_close(u_smooth, scale * normalise * smooth)
+    torch.testing.assert_close(grad_smooth, scale * normalise * gradient)
     assert u_student.norm(dim=-1).max() <= max_norm + 1e-12
-    # a small field is left unscaled
-    u_small, g_small, _ = ho_views._student_displacement(
-        0.01 * field, gradient, iid, sigma, max_norm
+    # a small field is left unscaled (by the safety factor), at the requested RMS
+    u_small, g_small, _, s_small = ho_views._student_displacement(
+        0.01 * field, gradient, iid, sigma, max_norm, 0.01
     )
-    torch.testing.assert_close(u_small, 0.01 * smooth)
-    assert torch.equal(g_small, gradient)
+    assert float(s_small) == 1.0
+    r_small = (0.01 * smooth).pow(2).sum(-1).mean().sqrt()
+    torch.testing.assert_close(
+        u_small.pow(2).sum(-1).mean().sqrt(), torch.tensor(0.01, dtype=torch.float64)
+    )
+    torch.testing.assert_close(u_small, 0.01 * (0.01 * smooth) / r_small)
+    torch.testing.assert_close(g_small, 0.01 * gradient / r_small)
+
+
+def test_student_displacement_of_a_zero_field_is_finite():
+    u_smooth, grad, u_student, scale = ho_views._student_displacement(
+        torch.zeros(1, 3), torch.zeros(1, 3, 3), torch.zeros(1, 3), 0.03, 0.25, 0.05
+    )
+    assert torch.isfinite(u_student).all() and torch.isfinite(grad).all()
+    assert float(scale) == 1.0
+
+
+@pytest.mark.parametrize("rms", [0.02, 0.05])
+def test_smooth_field_has_the_requested_rms(large_batch, rms):
+    """The smooth field of every deformed structure (molecule and periodic cell) has
+    a per-structure RMS displacement ``field_amplitude`` before the safety scaling,
+    i.e. ``RMS(u_smooth) = field_scale * field_amplitude``."""
+    _, _, v = _views(large_batch, p_def=1.0, field_amplitude=rms, iid_sigma=0.0)
+    ho = v.extras["high_order"]
+    assert ho.field_scale.shape == (2,)
+    for k in range(2):
+        u = ho.u_smooth[ho.structure_index == k]
+        assert torch.allclose(u.mean(0), torch.zeros(3, dtype=u.dtype), atol=1e-12)
+        measured = u.pow(2).sum(-1).mean().sqrt()
+        torch.testing.assert_close(measured, ho.field_scale[k] * rms)
+        assert ho.field_scale[k] == 1.0
+
+
+def test_field_scale_is_one_without_deformation(large_batch):
+    _, _, v = _views(large_batch, p_def=0.0)
+    assert (v.extras["high_order"].field_scale == 1.0).all()
+
+
+def test_safety_scale_binds_for_a_large_amplitude(large_batch):
+    _, _, v = _views(large_batch, p_def=1.0, field_amplitude=0.5)
+    ho = v.extras["high_order"]
+    assert (ho.field_scale < 1.0).all()
+    assert (
+        ho.u_student.norm(dim=-1).max() <= large_batch[2]["noise"]["skin"] / 2 + 1e-12
+    )
+
+
+def test_default_safety_scale_is_one_for_most_structures():
+    """With the default amplitude the safety scaling is inactive for the large
+    majority of QM9 molecules and of ~1000-atom periodic cells."""
+    hypers_batch = make_batch(ase.io.read(QM9_PATH, ":100"), torch.float64)
+    _, _, v = _views(hypers_batch, p_def=1.0)
+    qm9 = v.extras["high_order"].field_scale
+    assert float((qm9 == 1.0).double().mean()) >= 0.9
+    rng = np.random.default_rng(0)
+    frames = []
+    for _ in range(10):
+        grid = np.stack(np.meshgrid(*[np.arange(10)] * 3, indexing="ij"), -1)
+        pos = 1.6 * grid.reshape(-1, 3) + 0.1 * rng.standard_normal((1000, 3))
+        frames.append(ase.Atoms("C1000", positions=pos, cell=[16.0] * 3, pbc=True))
+    big = make_batch(frames, torch.float64)
+    _, _, v = _views(big, p_def=1.0)
+    periodic = v.extras["high_order"].field_scale
+    assert float((periodic == 1.0).double().mean()) >= 0.9
 
 
 def test_deformed_views_split_smooth_and_iid(large_batch):

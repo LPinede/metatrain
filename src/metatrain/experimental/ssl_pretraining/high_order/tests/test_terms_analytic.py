@@ -91,6 +91,7 @@ def test_terms_return_finite_scalar_and_diagnostics(step_data):
         assert f"residual_multipole/l{l}/rmse" in diag
         assert f"residual_multipole/l{l}/norm_ratio" in diag
     _, diag = _jets(step_data)(step_data)
+    assert 0.0 < float(diag["deformation_jets/field_scale"]) <= 1.0
     for block in ("displacement", "dilation", "rotation", "shear"):
         assert f"deformation_jets/{block}/rmse" in diag
     _, diag = _chirality(step_data)(step_data)
