@@ -3,12 +3,14 @@ terms.
 
 Importing this package registers the ``high_order`` view builder and the loss terms
 ``residual_multipole``, ``deformation_jets``, ``chirality``,
-``equivariant_vicreg``, ``vicreg_averaged`` and ``rotation_conditioned_latent``.
+``equivariant_vicreg``, ``vicreg_averaged``, ``rotation_conditioned_latent`` and
+``action_response``.
 """
 
 from ..objective import register_view_builder
 from ..terms import register_term
 from .terms import (
+    ActionResponseTerm,
     ChiralityTerm,
     DeformationJetTerm,
     EquivariantVicregTerm,
@@ -27,5 +29,6 @@ for _term in (
     EquivariantVicregTerm,
     RotationAveragedVicregTerm,
     RotationConditionedLatentTerm,
+    ActionResponseTerm,
 ):
     register_term(_term)

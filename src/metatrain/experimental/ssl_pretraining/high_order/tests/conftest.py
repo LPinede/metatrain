@@ -88,6 +88,13 @@ def step_data_deformed(medium_batch, pet_core, small_teacher):
 
 
 @pytest.fixture
+def step_data_one_sided(medium_batch, pet_core, small_teacher):
+    """High-order step data of ``medium_batch`` with the one-sided teacher (clean
+    ``x0`` as ``Views.teacher``, ``x0 + u_T`` in the extra teacher views)."""
+    return make_step(medium_batch, pet_core, small_teacher, seed=1, teacher_pair=False)
+
+
+@pytest.fixture
 def step_data_two_rotations(medium_batch, pet_core, small_teacher):
     """High-order step data of ``medium_batch`` with the second student rotation."""
     return make_step(

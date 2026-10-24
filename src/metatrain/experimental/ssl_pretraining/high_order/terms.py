@@ -7,11 +7,14 @@ The analytic anchors:
   the smooth-field gradient, at the atoms of deformed structures;
 - ``chirality``: the triple product of three element-channel dipoles;
 
-the teacher term:
+the teacher terms:
 
 - ``rotation_conditioned_latent`` (C): the teacher latent, predicted through the
   student rotation and compared after a probe contraction, with an order
   curriculum (order 0: the invariant JEPA);
+- ``action_response`` (D5): the teacher's response to the windowed l=1 teacher
+  modes at the mode centres, predicted from the mode amplitudes mapped to the
+  student frame and compared after a probe contraction;
 
 and the collapse regularizers that need the second student rotation
 (``high_order.second_rotation``):
@@ -945,3 +948,233 @@ class RotationConditionedLatentTerm(torch.nn.Module):
     def on_validation_epoch_end(self, diagnostics: Mapping[str, Any]) -> None:
         """The trainer hook: :meth:`maybe_promote`."""
         self.maybe_promote(diagnostics)
+
+
+class ActionResponseTerm(torch.nn.Module):
+    """Term D5: the response of the teacher to the windowed l=1 teacher modes at
+    the mode centres, predicted from the student tokens and the mode amplitudes.
+
+    At each centre ``c`` (``HighOrderExtras.centers``), the teacher sees ``x0 +- u_T``
+    with ``u_T`` built from the amplitudes ``a_c`` (dilation (0, +), rotation
+    (1, -), shear (2, +); teacher frame). The response is
+    ``Delta = (h+ - h-) / 2`` with the antithetic teacher pair, or
+    ``Delta = h+ - h(x0)`` with the one-sided teacher. The prediction of the response
+    vector is ``Delta_hat = sum_blocks <a_S, A W>``: ``a_S = D^(l,sigma)(g_S) a`` are
+    the amplitudes mapped to the student frame (``det(g_S)`` for the axial rotation
+    block), ``A`` is a per-block head output ``(n_c, 2l+1, rank)`` on the student
+    tokens at the centre and ``W`` a learnable ``(rank, feature_dim)`` matrix (low
+    rank). Both sides are contracted with the step's probes ``v_p`` (redrawn every
+    step), ``v_p`` into ``W`` first, as in term C.
+
+    ``shuffle_amplitudes`` (the control): the amplitudes are permuted across the
+    centres of the batch (step generator) before the contraction, so they are
+    decorrelated from the actual ``u_T``.
+
+    The loss is ``weight * (L_D5 + floor_gamma * floors)``: ``L_D5`` is the
+    normalized MSE of the probe-contracted response (:func:`_block_loss`, skipped
+    with fewer than two centres or without target variance) and the rotation and
+    shear contributions get the per-batch variance floor at :data:`FLOOR_LEVEL`
+    target standard deviations (per probe, in units of the target scale). The term
+    is off (weight 0) while the training progress is below ``warmup_fraction``.
+
+    Monitors: ``rho_target = ||Delta|| / (mode_amplitude ||h_c||)`` (vector norms
+    over the centres of the batch, ``h_c`` the teacher latent of the clean
+    structure: the pair mean, or ``h(x0)``), the same ratio for each block's
+    predicted response (``rho_l{l}_{block}``), and the ``r2`` of the
+    probe-contracted prediction.
+
+    .. code-block:: python
+
+        term = ActionResponseTerm((256, 256), 512, 64, 1.0, 0.05)
+        loss, diagnostics = term(step)
+
+    :param dims: ``(Dn, De)`` token dimensions.
+    :param feature_dim: Dimension of the teacher latent.
+    :param hidden: Hidden width of the heads.
+    :param weight: Weight of the term.
+    :param mode_amplitude: Reference amplitude of ``rho``; ``None`` reads
+        ``high_order.mode_amplitude`` from the step hypers.
+    :param rank: Rank of each block's map to the teacher latent.
+    :param l_max: Highest order of the blocks (2: all three).
+    :param shuffle_amplitudes: Permute the amplitudes across the centres.
+    :param floor_gamma: Weight of the floors of the rotation and shear contributions.
+    :param warmup_fraction: Fraction of the steps with the term off.
+    :param head_kwargs: Keyword arguments of every :class:`BlockHead`.
+    """
+
+    name = "action_response"
+    needs_gradients = False
+    uses_prediction = False
+    BLOCKS = {"dilation": (0, 1), "rotation": (1, -1), "shear": (2, 1)}
+    """``(l, sigma)`` of each block."""
+    SLICES = {"dilation": slice(0, 1), "rotation": slice(1, 4), "shear": slice(4, 9)}
+    """Columns of each block in ``HighOrderExtras.center_amplitudes``."""
+
+    def __init__(
+        self,
+        dims: Tuple[int, int],
+        feature_dim: int,
+        hidden: int,
+        weight: float,
+        mode_amplitude: Optional[float] = None,
+        rank: int = 64,
+        l_max: int = 2,
+        shuffle_amplitudes: bool = False,
+        floor_gamma: float = 0.1,
+        warmup_fraction: float = 0.05,
+        head_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__()
+        self.weight, self.mode_amplitude, self.rank = weight, mode_amplitude, rank
+        self.shuffle_amplitudes, self.floor_gamma = shuffle_amplitudes, floor_gamma
+        self.warmup_fraction = warmup_fraction
+        self.required_targets: dict = {}
+        self.blocks = {k: v for k, v in self.BLOCKS.items() if v[0] <= l_max}
+        self.heads = torch.nn.ModuleDict(
+            {
+                block: BlockHead(dims, l, rank, hidden, **(head_kwargs or {}))
+                for block, (l, _) in self.blocks.items()
+            }
+        )
+        # W of each block as the weight (feature_dim, rank) of a bias-free linear map
+        self.maps = torch.nn.ModuleDict(
+            {
+                block: torch.nn.Linear(rank, feature_dim, bias=False)
+                for block in self.blocks
+            }
+        )
+        self.norm = BlockNormalizer()
+
+    @classmethod
+    def from_hypers(
+        cls, hypers: Dict[str, Any], context: TermContext
+    ) -> "ActionResponseTerm":
+        """Build the term from its hypers and the run's context."""
+        if context.feature_dim is None:
+            raise ValueError(f"the '{cls.name}' term needs `context.feature_dim`")
+        return cls(
+            dims=context.dims, feature_dim=context.feature_dim, **_head_kwargs(hypers)
+        )
+
+    def responses(self, step: StepData) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The teacher response ``Delta`` and the clean teacher latent ``h_c`` at
+        the centres, ``(n_c, feature_dim)`` each."""
+        centers = step.extras["high_order"].centers
+        extra = step.extras["teacher_features"]
+        teacher = step.teacher_features
+        if "minus" in extra:
+            # ``Views.teacher`` is the plus view of the antithetic pair
+            plus, minus = teacher[centers], extra["minus"][centers]
+            return 0.5 * (plus - minus), 0.5 * (plus + minus)
+        # one-sided: ``Views.teacher`` is the clean x0, the extra view is the plus
+        clean = teacher[centers]
+        return extra["plus"][centers] - clean, clean
+
+    def teacher_frame_targets(self, step: StepData) -> torch.Tensor:
+        """The probe-contracted responses at the centres, ``(n_c, num_probes)``."""
+        delta, _ = self.responses(step)
+        return delta @ step.probes.T.to(delta)
+
+    def amplitudes(self, step: StepData) -> torch.Tensor:
+        """The teacher-frame amplitudes of the centres, ``(n_c, 9)``, permuted
+        across the centres with ``shuffle_amplitudes``."""
+        amplitudes = step.extras["high_order"].center_amplitudes
+        if self.shuffle_amplitudes:
+            perm = torch.randperm(len(amplitudes), generator=step.extras["generator"])
+            amplitudes = amplitudes[perm.to(amplitudes.device)]
+        return amplitudes
+
+    def student_amplitudes(
+        self, step: Any, amplitudes: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """``D^(l,sigma)(g_S) a`` of each block at the centres, ``(n_c, 2l+1)``.
+
+        :param step: The step data (reads the centres and the student rotations).
+        :param amplitudes: Teacher-frame amplitudes ``(n_c, 9)``.
+        """
+        ho = step.extras["high_order"]
+        rotations = ho.rotations[ho.centers]
+        out = {}
+        for block, (l, sigma) in self.blocks.items():
+            a = amplitudes[:, self.SLICES[block]]
+            if block == "rotation":
+                a = a[:, list(XYZ_TO_L1)]  # xyz -> the real l=1 order
+            matrices = irrep_matrix(rotations.to(a), l, sigma)
+            out[block] = torch.einsum("nmp,np->nm", matrices, a)
+        return out
+
+    def rank_contributions(
+        self, step: StepData, amplitudes: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """``<a_S, A>`` of each block, per rank channel, ``(n_c, rank)``."""
+        ho = step.extras["high_order"]
+        tokens = step.extras["student_tokens"].select(ho.centers)
+        out = {}
+        for block, a_student in self.student_amplitudes(step, amplitudes).items():
+            heads = self.heads[block](tokens)  # (n_c, 2l+1, rank)
+            out[block] = torch.einsum("nm,nmk->nk", a_student.to(heads), heads)
+        return out
+
+    def _probed(
+        self, step: StepData, rank_parts: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """The probe contraction ``v_p . (<a_S, A> W)`` of each block,
+        ``(n_c, num_probes)``, with ``v_p`` contracted into ``W`` first."""
+        out = {}
+        for block, part in rank_parts.items():
+            probed = step.probes.to(part) @ self.maps[block].weight  # (P, rank)
+            out[block] = part @ probed.T
+        return out
+
+    def predict(self, step: StepData) -> torch.Tensor:
+        """The probe-contracted prediction at the centres, ``(n_c, num_probes)``."""
+        parts = self._probed(step, self.rank_contributions(step, self.amplitudes(step)))
+        return torch.stack(list(parts.values())).sum(0)
+
+    def forward(self, step: StepData) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        on = float(float(step.extras["step_fraction"]) >= self.warmup_fraction)
+        tokens: HeadInputs = step.extras["student_tokens"]
+        diag: Dict[str, torch.Tensor] = {}
+        if step.extras["high_order"].centers.numel() == 0:
+            zero = tokens.node.sum() * 0.0
+            diag[f"{self.name}/skipped"] = zero.new_ones(()).detach()
+            diag[f"{self.name}/loss"] = zero.detach()
+            diag[f"{self.name}/active"] = zero.new_tensor(on)
+            return zero, diag
+        target = self.teacher_frame_targets(step)
+        rank_parts = self.rank_contributions(step, self.amplitudes(step))
+        parts = self._probed(step, rank_parts)
+        pred = torch.stack(list(parts.values())).sum(0)
+        block = f"{self.name}/total"
+        loss = _block_loss(self.norm, block, pred, target, diag)
+        skipped = bool(diag[f"{block}/skipped"])
+        # per-batch floors of the rotation and shear contributions, per probe and
+        # relative to the target's spread, in units of the target scale
+        floor = pred.new_zeros(())
+        if not skipped:
+            scale = self.norm.scale(block)
+            level = FLOOR_LEVEL * target.std(dim=0) / scale
+            for name, part in parts.items():
+                if self.blocks[name][0] > 0:
+                    floor = floor + batch_variance_floor(part / scale, level)
+        loss = loss + self.floor_gamma * floor
+        if not skipped:
+            with torch.no_grad():
+                delta, clean = self.responses(step)
+                amplitude = self.mode_amplitude
+                if amplitude is None:
+                    amplitude = step.hypers["high_order"]["mode_amplitude"]
+                reference = amplitude * clean.norm().clamp(min=1e-12)
+                diag[f"{self.name}/rho_target"] = delta.norm() / reference
+                # each block's predicted response vector, relative likewise
+                for name, part in rank_parts.items():
+                    vector = part @ self.maps[name].weight.T
+                    l = self.blocks[name][0]
+                    diag[f"{self.name}/rho_l{l}_{name}"] = vector.norm() / reference
+                residual = (pred - target).pow(2).mean()
+                spread = (target - target.mean(dim=0)).pow(2).mean()
+                diag[f"{self.name}/r2"] = 1 - residual / spread.clamp(min=1e-12)
+        diag[f"{self.name}/floor"] = floor.detach()
+        diag[f"{self.name}/loss"] = loss.detach()
+        diag[f"{self.name}/active"] = loss.new_tensor(on)
+        return self.weight * on * loss, diag

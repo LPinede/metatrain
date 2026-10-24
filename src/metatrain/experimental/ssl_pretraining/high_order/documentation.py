@@ -5,7 +5,7 @@ This module is the single source of the defaults. It must stay torch-free: the
 shared ``documentation.py`` imports it.
 """
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Optional
 
 from pydantic import AfterValidator
 from typing_extensions import TypedDict
@@ -213,5 +213,40 @@ class RotationConditionedLatentTermHypers(TypedDict):
     floor_gamma: NonNegativeFloat = 0.1
     """Weight of the per-batch variance floor of each l > 0 block contribution (at
     0.1 target standard deviations)."""
+    head: AnchorHeadHypers = init_with_defaults(AnchorHeadHypers)
+    """Form of the heads."""
+
+
+class ActionResponseTermHypers(TypedDict):
+    """``action_response`` term (D5): at each teacher-mode centre, the response of
+    the teacher latent to the windowed l=1 teacher modes, ``(h+ - h-) / 2`` with
+    the antithetic teacher pair (else ``h+ - h(x0)``), predicted as
+    ``sum_blocks <D(g_S) a, A W>`` from the mode amplitudes ``a`` (dilation
+    (0, +), rotation (1, -), shear (2, +)) mapped to the student frame, per-block
+    heads ``A`` on the student tokens at the centre and low-rank maps ``W`` to the
+    latent; both sides are contracted with the step's probes. The rotation and shear
+    contributions get a per-batch variance floor at 0.1 target standard
+    deviations. The term is off during the first ``warmup_fraction`` of the
+    steps."""
+
+    weight: NonNegativeFloat = 1.0
+    """Weight of the term."""
+    hidden: PositiveInt = 64
+    """Hidden width of the heads."""
+    rank: PositiveInt = 64
+    """Rank of each block's map to the teacher latent."""
+    l_max: Literal[0, 1, 2] = 2
+    """Highest order of the blocks (1 drops the shear block)."""
+    mode_amplitude: Optional[PositiveFloat] = None
+    """Reference amplitude of the relative-response monitors ``rho``
+    (``action_response/rho_*``); ``null`` uses ``high_order.mode_amplitude``."""
+    shuffle_amplitudes: bool = False
+    """Control: permute the amplitudes across the centres of the batch before the
+    contraction, which decorrelates them from the actual teacher modes."""
+    warmup_fraction: Probability = 0.05
+    """Fraction of the steps with the term off."""
+    floor_gamma: NonNegativeFloat = 0.1
+    """Weight of the per-batch variance floor of the rotation and shear
+    contributions (at 0.1 target standard deviations)."""
     head: AnchorHeadHypers = init_with_defaults(AnchorHeadHypers)
     """Form of the heads."""

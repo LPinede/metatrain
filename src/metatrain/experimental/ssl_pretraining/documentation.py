@@ -45,6 +45,7 @@ from metatrain.pet.documentation import ModelHypers as PETModelHypers
 from metatrain.utils.hypers import init_with_defaults
 
 from .high_order.documentation import (
+    ActionResponseTermHypers,
     ChiralityTermHypers,
     DeformationJetsTermHypers,
     EquivariantVicregTermHypers,
@@ -215,6 +216,9 @@ class TermsHypers(TypedDict):
     ] = None
     """High-order method, term C: rotation-conditioned latent prediction (``l_max:
     0`` is the invariant JEPA)."""
+    action_response: NotRequired[Optional[ActionResponseTermHypers]] = None
+    """High-order method, term D5: response of the teacher to the teacher modes at
+    the mode centres, predicted from the student tokens and the mode amplitudes."""
 
 
 def _at_least_one_term(terms: dict) -> dict:

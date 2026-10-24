@@ -509,6 +509,7 @@ HIGH_ORDER_VIEW_TERMS = (
     "equivariant_vicreg",
     "vicreg_averaged",
     "rotation_conditioned_latent",
+    "action_response",
 )
 # the terms that read the second student rotation of the high-order views
 SECOND_ROTATION_TERMS = ("equivariant_vicreg", "vicreg_averaged")
