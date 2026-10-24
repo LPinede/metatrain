@@ -121,6 +121,7 @@ class Trainer(TrainerInterface):
             cutoff=options.cutoff,
             atomic_types=list(model.dataset_info.atomic_types),
             num_probes=hypers["num_probes"],
+            rotation_group=hypers["rotation_group"],
         )
         terms = build_terms(hypers["objective"]["terms"], context)
         ROOT_LOGGER.info("Active loss terms: " + ", ".join(term.name for term in terms))
@@ -286,6 +287,12 @@ class Trainer(TrainerInterface):
 
             train_info = {k: v / max(1, n_train) for k, v in train_metrics.items()}
             val_info = {k: v / max(1, n_val) for k, v in val_metrics.items()}
+            # per-epoch term state (e.g. the order curriculum of
+            # ``rotation_conditioned_latent``), before it is checkpointed
+            for term in terms:
+                hook = getattr(term, "on_validation_epoch_end", None)
+                if hook is not None:
+                    hook(val_info)
             if metric_logger is None:
                 metric_logger = MetricLogger(
                     log_obj=ROOT_LOGGER,
@@ -500,6 +507,7 @@ HIGH_ORDER_VIEW_TERMS = (
     "chirality",
     "equivariant_vicreg",
     "vicreg_averaged",
+    "rotation_conditioned_latent",
 )
 # the terms that read the second student rotation of the high-order views
 SECOND_ROTATION_TERMS = ("equivariant_vicreg", "vicreg_averaged")

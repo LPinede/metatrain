@@ -526,6 +526,46 @@ def test_trainer_passes_the_build_context_and_step_fraction(tmp_path, monkeypatc
     assert all(f == 1.0 for f in term.fractions[n_train:])
 
 
+class _EpochHook(_Recorder):
+    """A test-only term with the validation-epoch hook; records its arguments."""
+
+    name = "epoch_hook"
+
+    def __init__(self, context) -> None:
+        super().__init__(context)
+        self.epochs: list = []
+
+    def __call__(self, step):
+        loss, _ = super().__call__(step)
+        return loss, {"epoch_hook/value": loss.new_tensor(2.0)}
+
+    def on_validation_epoch_end(self, diagnostics) -> None:
+        self.epochs.append(dict(diagnostics))
+
+
+def test_trainer_calls_the_validation_epoch_hook(tmp_path, monkeypatch):
+    monkeypatch.setitem(terms_module.TERMS, "epoch_hook", _EpochHook)
+    monkeypatch.setattr(_Recorder, "built", [])
+    hypers = _trainer_hypers(num_epochs=2)
+    hypers["objective"]["terms"]["epoch_hook"] = {}
+    trainer = Trainer(hypers)
+    model = trainer.setup(small_model_hypers(), INFO)
+    trainer.train(
+        model,
+        torch.float32,
+        [torch.device("cpu")],
+        [_dataset()],
+        [_dataset()],
+        str(tmp_path),
+    )
+    (term,) = _Recorder.built
+    # once per epoch, with the epoch-averaged validation diagnostics
+    assert len(term.epochs) == 2
+    assert all(epoch["epoch_hook/value"] == 2.0 for epoch in term.epochs)
+    assert all("loss" in epoch for epoch in term.epochs)
+    assert term.context.rotation_group == "O3"
+
+
 def test_training_without_prediction_terms_builds_no_predictor(tmp_path):
     hypers = _trainer_hypers(num_epochs=1)
     hypers["objective"]["terms"] = {"vicreg": {"variance": 1.0, "covariance": 0.04}}

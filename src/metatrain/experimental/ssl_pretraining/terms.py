@@ -17,6 +17,11 @@ then moves it to the training device and dtype, trains its parameters with the
 student's optimizer (and gradient clipping), switches it between ``train()`` and
 ``eval()`` together with the student, and saves and restores its ``state_dict``
 under the term's name in the checkpoint (``grad_jepa.terms_state_dict``).
+
+A term may define ``on_validation_epoch_end(diagnostics)``: the trainer calls it
+once per epoch, after validation and before the checkpoint, with the
+epoch-averaged validation diagnostics (``Dict[str, float]``, every term's
+diagnostics and the loss).
 """
 
 from dataclasses import dataclass
@@ -56,6 +61,7 @@ class TermContext:
     cutoff: float  # the backbone cutoff
     atomic_types: List[int]  # the atomic types of the dataset
     num_probes: int  # the ``num_probes`` trainer hyperparameter
+    rotation_group: str = "O3"  # the ``rotation_group`` trainer hyperparameter
 
 
 TERMS: Dict[str, Callable[..., Term]] = {}

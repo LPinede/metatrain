@@ -92,7 +92,7 @@ def _three_distinct(value: list) -> list:
 
 
 class AnchorHeadHypers(TypedDict):
-    """Form of the per-block heads of an analytic term."""
+    """Form of the per-block heads of a term (analytic or teacher)."""
 
     use_edges: bool = False
     """Abbott et al.'s full per-block head (a node part plus a nonlinear map of each
@@ -178,3 +178,36 @@ class RotationAveragedVicregTermHypers(TypedDict):
     """Weight of the variance hinge."""
     covariance: NonNegativeFloat = 0.04
     """Weight of the covariance penalty."""
+
+
+class RotationConditionedLatentTermHypers(TypedDict):
+    """``rotation_conditioned_latent`` term (C): predicts the probe-contracted
+    teacher latent of the clean structure (the mean over the antithetic teacher
+    pair, else the clean teacher) at the latent targets, as
+    ``sum_{l <= L, sigma} <D^(l,sigma)(g_S), Phi^(l,sigma)>`` with per-block heads
+    on the student tokens. The number of probes is the trainer's ``num_probes``; the
+    pseudo heads exist only with ``rotation_group: O3``. ``l_max: 0`` is the
+    invariant JEPA.
+
+    Order curriculum: ``L = 0`` while the training progress is below
+    ``warmup_fraction``, then ``min(2, l_max)``; after the warm-up, ``L`` grows by
+    one (up to ``l_max``) when the norm ratio of order ``L`` stays above
+    ``promote_threshold`` for 3 consecutive validation epochs. There is no promotion
+    during the warm-up."""
+
+    weight: NonNegativeFloat = 1.0
+    """Weight of the term."""
+    l_max: NonNegativeInt = 4
+    """Highest order of the curriculum."""
+    hidden: PositiveInt = 64
+    """Hidden width of the heads and of the invariant context of masked atoms."""
+    promote_threshold: PositiveFloat = 0.2
+    """Norm ratio of the highest active order above which it counts towards a
+    promotion."""
+    warmup_fraction: Probability = 0.05
+    """Fraction of the steps with ``L = 0``."""
+    floor_gamma: NonNegativeFloat = 0.1
+    """Weight of the per-batch variance floor of each l > 0 block contribution (at
+    0.1 target standard deviations)."""
+    head: AnchorHeadHypers = init_with_defaults(AnchorHeadHypers)
+    """Form of the heads."""

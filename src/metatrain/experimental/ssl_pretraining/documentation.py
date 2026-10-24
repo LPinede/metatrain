@@ -54,6 +54,7 @@ from .high_order.documentation import (
     PositiveInt,
     ResidualMultipoleTermHypers,
     RotationAveragedVicregTermHypers,
+    RotationConditionedLatentTermHypers,
 )
 
 
@@ -209,6 +210,11 @@ class TermsHypers(TypedDict):
     vicreg_averaged: NotRequired[Optional[RotationAveragedVicregTermHypers]] = None
     """High-order method: VICReg on the features averaged over two rotations of the
     student input (needs ``high_order.second_rotation``)."""
+    rotation_conditioned_latent: NotRequired[
+        Optional[RotationConditionedLatentTermHypers]
+    ] = None
+    """High-order method, term C: rotation-conditioned latent prediction (``l_max:
+    0`` is the invariant JEPA)."""
 
 
 def _at_least_one_term(terms: dict) -> dict:
