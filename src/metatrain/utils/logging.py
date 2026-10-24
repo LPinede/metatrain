@@ -45,6 +45,11 @@ class CSVFileHandler(logging.FileHandler):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._header_written = False
+        # the columns, their units and the rows written so far (to rewrite the
+        # file when a new column appears)
+        self._keys: List[str] = []
+        self._units: Dict[str, str] = {}
+        self._rows: List[Dict[str, str]] = []
 
     def _open(self) -> Any:
         # Open with newline='' so that csv.writer controls line endings
@@ -68,23 +73,44 @@ class CSVFileHandler(logging.FileHandler):
     def emit_data(self, keys: List[str], values: List[str], units: List[str]) -> None:
         """Write structured data to the CSV file.
 
-        ``keys`` and ``values`` are written only the first time this methods is called.
+        ``keys`` and ``units`` are written only the first time this methods is called.
+        Each value goes under the column of its key: a column without a value in
+        this row gets ``nan``, and a key that is not yet a column adds one (the file
+        is then rewritten with the extended header).
 
         :param keys: Column header names
         :param values: Data values to write
         :param units: Units for each column
         """
         _validate_length(keys, values, units)
+        row = dict(zip(keys, values, strict=True))
+        new_keys = [key for key in keys if key not in self._units]
+        for key, unit in zip(keys, units, strict=True):
+            self._units.setdefault(key, unit)
+        self._keys += new_keys
+        self._rows.append(row)
+
+        if self._header_written and len(new_keys) > 0:
+            # rewrite the rows written so far under the extended header
+            with open(
+                self.baseFilename, "w", encoding=self.encoding, newline=""
+            ) as file:
+                writer = csv.writer(file)
+                writer.writerow(self._keys)
+                writer.writerow([self._units[key] for key in self._keys])
+                for previous in self._rows:
+                    writer.writerow([previous.get(key, "nan") for key in self._keys])
+            return
 
         with self._open() as file:
             writer = csv.writer(file)
 
             if not self._header_written:
-                writer.writerow(keys)
-                writer.writerow(units)
+                writer.writerow(self._keys)
+                writer.writerow([self._units[key] for key in self._keys])
                 self._header_written = True
 
-            writer.writerow(values)
+            writer.writerow([row.get(key, "nan") for key in self._keys])
 
 
 class WandbHandler(logging.Handler):

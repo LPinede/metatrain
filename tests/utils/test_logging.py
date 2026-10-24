@@ -138,6 +138,35 @@ def test_csv_file_handler_emit_data(monkeypatch, tmp_path):
     handler.close()
 
 
+def test_csv_file_handler_aligns_rows_with_changing_keys(monkeypatch, tmp_path):
+    """A row with a missing key gets ``nan`` in that column, and a new key adds a
+    column (the file is rewritten with the extended header), so every value stays
+    under its own header (diagnostics reported on some epochs only)."""
+    monkeypatch.chdir(tmp_path)
+    log_file = tmp_path / "log.csv"
+    handler = CSVFileHandler(filename=log_file, encoding="utf-8")
+
+    handler.emit_data(["Epoch", "a", "b"], ["0", "1", "2"], ["", "eV", ""])
+    handler.emit_data(["Epoch", "b"], ["1", "3"], ["", ""])
+    assert read_csv(log_file) == [
+        ["Epoch", "a", "b"],
+        ["", "eV", ""],
+        ["0", "1", "2"],
+        ["1", "nan", "3"],
+    ]
+    handler.emit_data(
+        ["Epoch", "a", "c", "b"], ["2", "4", "5", "6"], ["", "eV", "s", ""]
+    )
+    assert read_csv(log_file) == [
+        ["Epoch", "a", "b", "c"],
+        ["", "eV", "", "s"],
+        ["0", "1", "2", "nan"],
+        ["1", "nan", "3", "nan"],
+        ["2", "4", "6", "5"],
+    ]
+    handler.close()
+
+
 def test_csv_file_handler_emit_does_nothing(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     log_file = Path("log.csv")
