@@ -126,7 +126,7 @@ class ResidualMultipoleTermHypers(TypedDict):
 class DeformationJetsTermHypers(TypedDict):
     """``deformation_jets`` term (B): the student displacement and the dilation,
     local rotation and shear of the smooth field, at the atoms of deformed
-    structures."""
+    structures with three or more atoms."""
 
     weight: NonNegativeFloat = 1.0
     """Weight of the term."""

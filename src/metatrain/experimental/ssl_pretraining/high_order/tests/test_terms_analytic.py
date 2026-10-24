@@ -9,7 +9,10 @@ import torch
 
 from metatrain.experimental.ssl_pretraining.documentation import TermsHypers
 from metatrain.experimental.ssl_pretraining.high_order import documentation
-from metatrain.experimental.ssl_pretraining.high_order.irreps import irrep_matrix
+from metatrain.experimental.ssl_pretraining.high_order.irreps import (
+    XYZ_TO_L1,
+    irrep_matrix,
+)
 from metatrain.experimental.ssl_pretraining.high_order.terms import (
     ChiralityTerm,
     DeformationJetTerm,
@@ -24,6 +27,7 @@ from metatrain.experimental.ssl_pretraining.terms import (
 )
 from metatrain.experimental.ssl_pretraining.tests import (
     CARBON_PATH,
+    QM9_PATH,
     small_pet,
 )
 from metatrain.utils.architectures import check_architecture_options, get_default_hypers
@@ -417,6 +421,29 @@ def test_blocks_without_target_variance_are_skipped(achiral_step_data, step_data
     stored = dict(term.norm.var)
     term(achiral_step_data)
     assert term.norm.var == stored
+
+
+def test_jets_leave_out_structures_with_fewer_than_three_atoms(pet_core, small_teacher):
+    """B's sites are the atoms of deformed structures with at least three atoms:
+    the smooth-field gradient of a monomer or dimer is (mostly) not identifiable
+    from the structure, and its per-structure normalisation is heavy-tailed."""
+    frames = [
+        ase.Atoms("CO", positions=[[0.0, 0.0, 0.0], [1.13, 0.0, 0.0]]),
+        ase.Atoms("H", positions=[[3.0, 0.0, 0.0]]),
+        ase.io.read(QM9_PATH, 1),
+    ]
+    batch = make_batch(frames, torch.float32)
+    step = make_step(batch, pet_core, small_teacher, p_def=1.0)
+    ho = step.extras["high_order"]
+    term = _jets(step)
+    targets, preds = term.teacher_frame_targets(step), term.predict(step)
+    n_large = len(frames[2])
+    for block in term.BLOCKS:
+        assert targets[block].shape[0] == preds[block].shape[0] == n_large
+    torch.testing.assert_close(
+        targets["displacement"][:, :, 0],
+        ho.u_student[ho.structure_index == 2][:, list(XYZ_TO_L1)],
+    )
 
 
 def test_isolated_deformed_atom_is_skipped(pet_core, small_teacher):

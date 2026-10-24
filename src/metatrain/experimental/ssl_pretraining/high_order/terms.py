@@ -4,7 +4,8 @@ The analytic anchors:
 
 - ``residual_multipole`` (A): the residual multipoles of the boundary atoms;
 - ``deformation_jets`` (B): the student displacement and the irreducible parts of
-  the smooth-field gradient, at the atoms of deformed structures;
+  the smooth-field gradient, at the atoms of deformed structures of three or more
+  atoms;
 - ``chirality``: the triple product of three element-channel dipoles;
 
 the teacher terms:
@@ -48,6 +49,12 @@ from .views import HighOrderExtras
 
 MIN_CHIRALITY_NEIGHBORS = 3
 """Minimum number of neighbours within the cutoff of a chirality site."""
+
+MIN_JET_ATOMS = 3
+"""Minimum number of atoms of a structure whose atoms are sites of
+``deformation_jets``: the smooth-field gradient of a monomer or dimer is mostly not
+identifiable from the structure, and its per-structure normalisation is
+heavy-tailed."""
 
 FLOOR_LEVEL = 0.1
 """Level of the per-batch variance floor of each component, in standard deviations
@@ -237,9 +244,9 @@ def jet_targets(u: torch.Tensor, grad: torch.Tensor) -> Dict[str, torch.Tensor]:
 
 
 class DeformationJetTerm(torch.nn.Module):
-    """Term B: at the atoms of deformed structures (all visible), the student
-    displacement ``u_S`` and the dilation, local rotation and shear of the exact
-    smooth-field gradient.
+    """Term B: at the atoms of deformed structures (all visible) with at least
+    :data:`MIN_JET_ATOMS` atoms, the student displacement ``u_S`` and the dilation,
+    local rotation and shear of the exact smooth-field gradient.
 
     :param dims: ``(Dn, De)`` token dimensions.
     :param hidden: Hidden width of the heads.
@@ -288,7 +295,12 @@ class DeformationJetTerm(torch.nn.Module):
 
     @staticmethod
     def _sites(ho: HighOrderExtras) -> torch.Tensor:
-        return ho.branch_deformed[ho.structure_index] & (ho.boundary | ho.context)
+        sizes = torch.bincount(ho.structure_index)[ho.structure_index]
+        return (
+            ho.branch_deformed[ho.structure_index]
+            & (ho.boundary | ho.context)
+            & (sizes >= MIN_JET_ATOMS)
+        )
 
     def teacher_frame_targets(self, step: StepData) -> Dict[str, torch.Tensor]:
         """The targets, ``(n_sites, 2l+1, 1)`` per block."""
