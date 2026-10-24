@@ -718,8 +718,17 @@ def test_trainer_logs_the_monitors(tmp_path, monkeypatch, monitor_every):
     train, val = records[-1]
     cosines = [key for key in train if key.startswith("monitor/cos/")]
     if monitor_every:
-        # every pair of the 4 default terms, and in [-1, 1]
-        assert len(cosines) == 6 and all(-1.0 <= train[k] <= 1.0 for k in cosines)
+        # the pairs of the default terms with a gradient on the last layer (the
+        # gradient_spread hinge is inactive here: no gradient, no pair), in [-1, 1]
+        names = ["gradient", "gradient_spread", "latent", "vicreg"]
+        pairs = {f"monitor/cos/{a}__{b}" for a in names for b in names if a < b}
+        assert set(cosines) <= pairs
+        assert {
+            "monitor/cos/gradient__latent",
+            "monitor/cos/gradient__vicreg",
+            "monitor/cos/latent__vicreg",
+        } <= set(cosines)
+        assert all(-1.0 <= train[k] <= 1.0 for k in cosines)
     else:
         assert cosines == []
     assert not any(key.startswith("monitor/cos/") for key in val)

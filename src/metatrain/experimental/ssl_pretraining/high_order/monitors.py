@@ -51,12 +51,14 @@ def gradient_cosines(
     """Pairwise cosines of the gradients of the per-term losses.
 
     The graph is kept, so the losses can still be back-propagated afterwards. A
-    loss that does not depend on the parameters (or on anything trainable) has a
-    zero gradient and a cosine of 0 with the others.
+    loss with a zero gradient on the parameters (independent of them, or a term
+    skipped on this step) has no direction: its pairs are left out, so that the
+    trainer's per-key averages cover only the steps where both terms contributed.
 
     :param losses: The loss of each term, by name.
     :param parameters: The parameters to take the gradients on.
-    :return: The cosine of every pair, under the key ``"{a}__{b}"`` (names sorted).
+    :return: The cosine of every pair of terms with non-zero gradients, under the
+        key ``"{a}__{b}"`` (names sorted).
     """
     parameters = list(parameters)
     gradients: Dict[str, torch.Tensor] = {}
@@ -73,7 +75,7 @@ def gradient_cosines(
                 for g, p in zip(grads, parameters, strict=True)
             ]
         )
-    names = sorted(gradients)
+    names = sorted(name for name, g in gradients.items() if bool(g.any()))
     cosines: Dict[str, float] = {}
     for i, a in enumerate(names):
         for b in names[i + 1 :]:

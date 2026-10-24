@@ -50,20 +50,27 @@ def test_gradient_cosines_identical_losses_are_one():
 
 
 def test_gradient_cosines_opposite_orthogonal_and_independent():
+    """Pairs with a term without gradient on the parameters (independent of them,
+    or skipped with a zero loss in the graph) are left out: a cosine with a zero
+    vector is not a measurement, and the trainer averages each key over the steps
+    that report it."""
     p = torch.nn.Parameter(torch.randn(6))
     q = torch.nn.Parameter(torch.randn(6))
     losses = {
         "c": (p**2).sum(),
         "a": (p * p.detach()).sum(),
         "b": -(p * p.detach()).sum(),
+        "f": p[0] * 0.0 + p[1],  # orthogonal to a gradient along p[0] only
+        "g": p[0],
         "d": (q**2).sum(),  # does not depend on p
         "e": torch.zeros(()),  # no graph at all
+        "h": p.sum() * 0.0,  # a skipped term: in the graph, zero gradient
     }
     cos = gradient_cosines(losses, [p])
-    assert set(cos) == {f"{a}__{b}" for a in "abcd" for b in "bcde" if a < b}
+    assert set(cos) == {f"{a}__{b}" for a in "abcfg" for b in "abcfg" if a < b}
     assert abs(cos["a__b"] + 1.0) < 1e-6
     assert abs(cos["a__c"] - 1.0) < 1e-6
-    assert cos["a__d"] == 0.0 and cos["d__e"] == 0.0
+    assert cos["f__g"] == 0.0
 
 
 def test_gradient_cosines_keep_the_graph():
