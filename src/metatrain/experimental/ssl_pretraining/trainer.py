@@ -114,7 +114,10 @@ class Trainer(TrainerInterface):
         device = devices[0]
         # the view builders also read the atomic types of the dataset (a runtime
         # key, not a hyperparameter: ``self.hypers`` is unchanged)
-        hypers = {**self.hypers, "atomic_types": list(model.dataset_info.atomic_types)}
+        hypers: Any = {
+            **self.hypers,
+            "atomic_types": list(model.dataset_info.atomic_types),
+        }
 
         student = model.core
         if hypers["restart_from"] is not None:
