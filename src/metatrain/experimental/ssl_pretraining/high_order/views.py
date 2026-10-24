@@ -81,6 +81,9 @@ class HighOrderExtras:
     structure_index: torch.Tensor  # (n_atoms,) structure of each atom
     student_pairs: torch.Tensor  # (n_student_pairs, 2) kept student pairs < cutoff
     student_distances: torch.Tensor  # (n_student_pairs,) their student distances
+    # (n_structures,) fraction of the atoms whose teacher displacement u_T was scaled
+    # down by the per-atom skin cap (0 without centres)
+    teacher_cap_fraction: torch.Tensor
     # (n_atoms, 3, 3) total rotation g2 g_S of the second student view of each
     # atom, with ``high_order.second_rotation`` (else None)
     rotations2: Optional[torch.Tensor] = None
@@ -419,12 +422,11 @@ def build_high_order_views(
         )
         amplitudes = amplitudes.to(device=device, dtype=dtype)
         centers = centers.to(device)
-        u_teacher = cap_norm(
-            _teacher_displacement(
-                positions, cell, system.pbc, centers, amplitudes, ho["mode_window"]
-            ),
-            max_norm,
+        u_uncapped = _teacher_displacement(
+            positions, cell, system.pbc, centers, amplitudes, ho["mode_window"]
         )
+        u_teacher = cap_norm(u_uncapped, max_norm)
+        cap_fraction = (u_uncapped.norm(dim=-1) > max_norm).to(dtype).mean()
 
         # the main teacher view (the shared teacher pass) and the extra one
         if ho["teacher_pair"]:
@@ -466,6 +468,7 @@ def build_high_order_views(
             ),
             student_pairs=student_nl.samples.values[student_close, :2].long() + offset,
             student_distances=student_distances[student_close],
+            teacher_cap_fraction=cap_fraction.reshape(1),
             masked=masked,
             latent_targets=(masked & reachable) | ~masked,
         )

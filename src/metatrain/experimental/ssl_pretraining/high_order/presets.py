@@ -208,6 +208,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         _full(action_response={"shuffle_amplitudes": True}), teacher_pair=True
     ),
     # proper rotations only: no pseudo heads in C, no chirality
+    # D5 keeps its (1, -) block here on purpose: it is the axial-rotation amplitude,
+    # not a parity duplicate
     "high_order_so3": _preset(
         _full(chirality=None), rotation_group="SO3", teacher_pair=True
     ),

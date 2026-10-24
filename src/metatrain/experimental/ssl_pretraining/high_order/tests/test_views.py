@@ -295,6 +295,7 @@ def test_extras_shapes_and_consistency(large_batch):
         "structure_index": ((n_atoms,), torch.long),
         "student_pairs": ((ho.student_pairs.shape[0], 2), torch.long),
         "student_distances": ((ho.student_pairs.shape[0],), dtype),
+        "teacher_cap_fraction": ((n_structures,), dtype),
     }
     assert {f.name for f in fields(HighOrderExtras)} == set(expected)
     for name, (shape, field_dtype) in expected.items():
@@ -730,3 +731,15 @@ def test_extra_student_views_are_encoded_with_gradients(
     assert extra.node.requires_grad and extra.edge.requires_grad
     assert "student_tokens_extra" in RESERVED_EXTRAS
     assert step_data.extras["student_tokens_extra"] == {}
+
+
+def test_teacher_cap_fraction(large_batch):
+    n_structures = len(large_batch[0])
+    _, _, small = _views(large_batch, mode_amplitude=1e-4)
+    ho = small.extras["high_order"]
+    assert ho.teacher_cap_fraction.shape == (n_structures,)
+    assert (ho.teacher_cap_fraction == 0).all()
+    # a large amplitude makes the skin cap bind, and the fraction is a fraction
+    _, _, large = _views(large_batch, mode_amplitude=5.0)
+    fraction = large.extras["high_order"].teacher_cap_fraction
+    assert ((fraction > 0) & (fraction <= 1)).all()

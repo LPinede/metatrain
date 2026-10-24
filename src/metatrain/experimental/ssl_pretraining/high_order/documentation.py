@@ -230,7 +230,9 @@ class ActionResponseTermHypers(TypedDict):
     latent; both sides are contracted with the step's probes. The rotation and shear
     contributions get a per-batch variance floor at 0.1 target standard
     deviations. The term is off during the first ``warmup_fraction`` of the
-    steps."""
+    steps. It needs a batch of at least 32 structures: about half of the
+    structures have a teacher-mode centre in a step (``action_response/n_centers``),
+    and the term is skipped with fewer than two centres."""
 
     weight: NonNegativeFloat = 1.0
     """Weight of the term."""

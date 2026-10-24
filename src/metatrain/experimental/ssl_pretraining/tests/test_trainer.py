@@ -8,6 +8,9 @@ from metatrain.experimental.ssl_pretraining import objective
 from metatrain.experimental.ssl_pretraining import terms as terms_module
 from metatrain.experimental.ssl_pretraining import trainer as trainer_module
 from metatrain.experimental.ssl_pretraining.documentation import TrainerHypers
+from metatrain.experimental.ssl_pretraining.high_order.monitors import (
+    FlatteningMonitor,
+)
 from metatrain.experimental.ssl_pretraining.trainer import (
     Trainer,
     check_hypers,
@@ -670,3 +673,96 @@ def test_freeze_backbone_needs_something_to_train(tmp_path):
             [dataset],
             str(tmp_path),
         )
+
+
+def test_accumulate_averages_over_the_steps_that_reported_the_key():
+    total: dict = {}
+    counts: dict = {}
+    steps = [{"a": 1.0, "b": 4.0}, {"a": 3.0}, {"a": 5.0, "b": 8.0, "c": 7.0}]
+    for values in steps:
+        trainer_module._accumulate(total, counts, values)
+    assert counts == {"a": 3, "b": 2, "c": 1}
+    assert trainer_module._average(total, counts) == {"a": 3.0, "b": 6.0, "c": 7.0}
+
+
+def _record_metrics(monkeypatch) -> list:
+    """Record the ``[train, validation]`` metrics passed to the metric logger."""
+    records: list = []
+    original = trainer_module.MetricLogger.log
+
+    def log(self, metrics, *args, **kwargs):
+        records.append(metrics)
+        return original(self, metrics, *args, **kwargs)
+
+    monkeypatch.setattr(trainer_module.MetricLogger, "log", log)
+    return records
+
+
+def _train_small(tmp_path, hypers) -> None:
+    trainer = Trainer(hypers)
+    model = trainer.setup(small_model_hypers(), INFO)
+    trainer.train(
+        model,
+        torch.float32,
+        [torch.device("cpu")],
+        [_dataset()],
+        [_dataset()],
+        str(tmp_path),
+    )
+
+
+@pytest.mark.parametrize("monitor_every", [1, 0])
+def test_trainer_logs_the_monitors(tmp_path, monkeypatch, monitor_every):
+    records = _record_metrics(monkeypatch)
+    _train_small(tmp_path, _trainer_hypers(num_epochs=1, monitor_every=monitor_every))
+    train, val = records[-1]
+    cosines = [key for key in train if key.startswith("monitor/cos/")]
+    if monitor_every:
+        # every pair of the 4 default terms, and in [-1, 1]
+        assert len(cosines) == 6 and all(-1.0 <= train[k] <= 1.0 for k in cosines)
+    else:
+        assert cosines == []
+    assert not any(key.startswith("monitor/cos/") for key in val)
+    assert val["monitor/finite_rotation_invariance"] >= 0.0
+    assert "monitor/flattening" not in val  # no action_response term
+
+
+class _Flattening(_Recorder):
+    """A test-only term reporting a collapsing ``rho_target`` and a falling loss,
+    one value per validation epoch."""
+
+    name = "flattening"
+
+    def __init__(self, context) -> None:
+        super().__init__(context)
+        self.epochs: list = []
+
+    def __call__(self, step):
+        k = len(self.epochs)
+        return step.student_features.sum() * 0.0, {
+            "action_response/rho_target": step.probes.new_tensor(0.1**k),
+            "action_response/loss": step.probes.new_tensor(1.0 / (1 + k)),
+        }
+
+    def on_validation_epoch_end(self, diagnostics) -> None:
+        self.epochs.append(dict(diagnostics))
+
+
+def test_trainer_flags_winning_by_flattening(tmp_path, monkeypatch):
+    monkeypatch.setitem(terms_module.TERMS, "flattening", _Flattening)
+    monkeypatch.setattr(_Recorder, "built", [])
+    monkeypatch.setattr(
+        trainer_module, "FlatteningMonitor", lambda: FlatteningMonitor(2, 1.5)
+    )
+    warnings_logged: list = []
+    monkeypatch.setattr(
+        trainer_module.ROOT_LOGGER, "warning", lambda msg: warnings_logged.append(msg)
+    )
+    hypers = _trainer_hypers(num_epochs=3)
+    hypers["objective"]["terms"]["flattening"] = {}
+    _train_small(tmp_path, hypers)
+    (term,) = _Recorder.built
+    # the window of 2 epochs is full from the second one on; the response falls
+    # by 10x per epoch while the loss falls: the flag is raised and logged
+    assert [e["monitor/flattening"] for e in term.epochs] == [0.0, 1.0, 1.0]
+    assert len(warnings_logged) == 2 and "flattening" in warnings_logged[0]

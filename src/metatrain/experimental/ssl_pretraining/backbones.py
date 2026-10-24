@@ -98,6 +98,14 @@ class Backbone(Protocol):
             if the backbone does not expose them.
         """
 
+    def last_layer_parameters(self, core: torch.nn.Module) -> List[torch.nn.Parameter]:
+        """The trainable parameters of the last backbone layer (for the gradient
+        monitors).
+
+        :param core: The backbone core.
+        :return: The parameters that require grad.
+        """
+
     def validate(self, model_hypers: Dict[str, Any]) -> None:
         """Reject the model hypers that the SSL wrapper does not support.
 
@@ -172,6 +180,9 @@ class PETBackbone:
         assert capture.edge is not None
         assert capture.cutoff is not None
         return features, HeadInputs(capture.node, capture.edge, capture.cutoff)
+
+    def last_layer_parameters(self, core: torch.nn.Module) -> List[torch.nn.Parameter]:
+        return [p for p in core.backend.gnn_layers[-1].parameters() if p.requires_grad]
 
     def validate(self, model_hypers: Dict[str, Any]) -> None:
         if model_hypers["long_range"]["enable"]:

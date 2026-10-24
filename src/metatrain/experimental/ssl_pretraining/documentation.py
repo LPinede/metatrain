@@ -305,6 +305,10 @@ class TrainerHypers(TypedDict):
     """Number of data-loading workers (chosen automatically if ``None``)."""
     log_interval: int = 1
     """Interval (in epochs) between logs."""
+    monitor_every: int = 200
+    """Interval (in steps) between the gradient cosines of the per-term losses on
+    the last backbone layer (logged as ``monitor/cos/<a>__<b>``); 0 turns them
+    off. Each one costs one backward pass per term."""
     checkpoint_interval: int = 10
     """Interval (in epochs) between checkpoints (the last epoch is always
     saved)."""

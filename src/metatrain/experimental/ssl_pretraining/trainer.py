@@ -28,7 +28,12 @@ from metatrain.utils.wrapper import MetatrainModel
 from . import checkpoints
 from .backbones import BACKBONES, Backbone
 from .conditioners import build_conditioners
-from .objective import VIEW_BUILDERS, grad_jepa_loss
+from .high_order.monitors import (
+    FlatteningMonitor,
+    finite_rotation_invariance,
+    gradient_cosines,
+)
+from .objective import VIEW_BUILDERS, grad_jepa_loss, grad_jepa_term_losses
 from .predictor import GradJEPAPredictor
 from .terms import TermContext, build_terms
 from .views import get_skin_neighbor_list_transform
@@ -223,6 +228,8 @@ class Trainer(TrainerInterface):
         if self.best_metric is None:
             self.best_metric = float("inf")
         epoch = start_epoch
+        flattening_monitor = FlatteningMonitor()
+        monitor_parameters = self.backbone.last_layer_parameters(student)
         metric_logger: Optional[MetricLogger] = None
 
         for epoch in range(start_epoch, hypers["num_epochs"]):
@@ -231,23 +238,56 @@ class Trainer(TrainerInterface):
             student.train()
             term_modules.train()
             train_metrics: Dict[str, float] = {}
-            n_train = 0
+            train_counts: Dict[str, int] = {}
             for batch in train_dataloader:
                 optimizer.zero_grad()
                 systems, _, _ = unpack_batch(batch)
                 systems, _, _ = batch_to(systems, {}, {}, dtype=dtype, device=device)
-                loss, metrics = grad_jepa_loss(
-                    student,
-                    teacher,
-                    predictor,
-                    terms,
-                    systems,
-                    options,
-                    hypers,
-                    generator,
-                    backbone=self.backbone,
-                    step_fraction=self.step / max(1, total_steps),
+                step_fraction = self.step / max(1, total_steps)
+                monitor_step = (
+                    hypers["monitor_every"] > 0
+                    and (self.step + 1) % hypers["monitor_every"] == 0
+                    and len(monitor_parameters) > 0
                 )
+                if monitor_step:
+                    # per-term losses, for the gradient cosines
+                    losses, metrics = grad_jepa_term_losses(
+                        student,
+                        teacher,
+                        predictor,
+                        terms,
+                        systems,
+                        options,
+                        hypers,
+                        generator,
+                        backbone=self.backbone,
+                        step_fraction=step_fraction,
+                    )
+                    values = list(losses.values())
+                    loss = values[0]
+                    for term_loss in values[1:]:
+                        loss = loss + term_loss
+                    metrics.update(
+                        {
+                            f"monitor/cos/{key}": value
+                            for key, value in gradient_cosines(
+                                losses, monitor_parameters
+                            ).items()
+                        }
+                    )
+                else:
+                    loss, metrics = grad_jepa_loss(
+                        student,
+                        teacher,
+                        predictor,
+                        terms,
+                        systems,
+                        options,
+                        hypers,
+                        generator,
+                        backbone=self.backbone,
+                        step_fraction=step_fraction,
+                    )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, hypers["grad_clip_norm"])
                 optimizer.step()
@@ -259,13 +299,16 @@ class Trainer(TrainerInterface):
                     # a frozen backbone: the teacher stays equal to the student
                     ema_update(teacher, student, tau)
                 self.step += 1
-                _accumulate(train_metrics, {"loss": float(loss.detach()), **metrics})
-                n_train += 1
+                _accumulate(
+                    train_metrics,
+                    train_counts,
+                    {"loss": float(loss.detach()), **metrics},
+                )
 
             student.eval()
             term_modules.eval()
             val_metrics: Dict[str, float] = {}
-            n_val = 0
+            val_counts: Dict[str, int] = {}
             for index, batch in enumerate(val_dataloader):
                 systems, _, _ = unpack_batch(batch)
                 systems, _, _ = batch_to(systems, {}, {}, dtype=dtype, device=device)
@@ -283,11 +326,32 @@ class Trainer(TrainerInterface):
                     backbone=self.backbone,
                     step_fraction=1.0,
                 )
-                _accumulate(val_metrics, {"loss": float(loss.detach()), **metrics})
-                n_val += 1
+                _accumulate(
+                    val_metrics, val_counts, {"loss": float(loss.detach()), **metrics}
+                )
+                if index == 0:
+                    # a fixed validation batch (forward only)
+                    invariance_systems = systems
 
-            train_info = {k: v / max(1, n_train) for k, v in train_metrics.items()}
-            val_info = {k: v / max(1, n_val) for k, v in val_metrics.items()}
+            train_info = _average(train_metrics, train_counts)
+            val_info = _average(val_metrics, val_counts)
+            val_info["monitor/finite_rotation_invariance"] = finite_rotation_invariance(
+                self.backbone, student, invariance_systems, options
+            )
+            if "action_response/rho_target" in val_info:
+                # D5 keys are present when the term had centres in the validation set
+                flattening = flattening_monitor.update(
+                    val_info["action_response/rho_target"],
+                    val_info["action_response/loss"],
+                )
+                val_info["monitor/flattening"] = float(flattening)
+                if flattening:
+                    ROOT_LOGGER.warning(
+                        "action_response: the relative response rho_target fell by "
+                        f"more than {flattening_monitor.factor}x over the last "
+                        f"{flattening_monitor.rho.maxlen} epochs while the loss "
+                        "fell (winning by flattening)"
+                    )
             # per-epoch term state (e.g. the order curriculum of
             # ``rotation_conditioned_latent``), before it is checkpointed
             for term in terms:
@@ -428,9 +492,19 @@ def _with_core(model: MetatrainModel, core: torch.nn.Module) -> Dict[str, Any]:
     return state
 
 
-def _accumulate(total: Dict[str, float], values: Dict[str, float]) -> None:
+def _accumulate(
+    total: Dict[str, float], counts: Dict[str, int], values: Dict[str, float]
+) -> None:
+    """Add ``values`` to the running sums, counting the additions of each key."""
     for name, value in values.items():
         total[name] = total.get(name, 0.0) + value
+        counts[name] = counts.get(name, 0) + 1
+
+
+def _average(total: Dict[str, float], counts: Dict[str, int]) -> Dict[str, float]:
+    """Mean of each key over the steps that reported it (a key reported on some
+    steps only is not diluted by the others)."""
+    return {name: value / counts[name] for name, value in total.items()}
 
 
 def get_collate_fns(

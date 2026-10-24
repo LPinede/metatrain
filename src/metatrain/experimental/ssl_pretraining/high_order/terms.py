@@ -985,7 +985,9 @@ class ActionResponseTerm(torch.nn.Module):
     over the centres of the batch, ``h_c`` the teacher latent of the clean
     structure: the pair mean, or ``h(x0)``), the same ratio for each block's
     predicted response (``rho_l{l}_{block}``), and the ``r2`` of the
-    probe-contracted prediction.
+    probe-contracted prediction. Also ``n_centers`` (centres of the step) and
+    ``cap_fraction`` (mean over the structures with a centre of the fraction of
+    atoms whose ``u_T`` the skin cap scaled down).
 
     .. code-block:: python
 
@@ -1139,7 +1141,10 @@ class ActionResponseTerm(torch.nn.Module):
         on = float(float(step.extras["step_fraction"]) >= self.warmup_fraction)
         tokens: HeadInputs = step.extras["student_tokens"]
         diag: Dict[str, torch.Tensor] = {}
-        if step.extras["high_order"].centers.numel() == 0:
+        ho = step.extras["high_order"]
+        n_centers = float(ho.centers.numel())
+        diag[f"{self.name}/n_centers"] = tokens.node.new_tensor(n_centers).detach()
+        if ho.centers.numel() == 0:
             zero = tokens.node.sum() * 0.0
             diag[f"{self.name}/skipped"] = zero.new_ones(()).detach()
             diag[f"{self.name}/loss"] = zero.detach()
@@ -1178,6 +1183,11 @@ class ActionResponseTerm(torch.nn.Module):
                 residual = (pred - target).pow(2).mean()
                 spread = (target - target.mean(dim=0)).pow(2).mean()
                 diag[f"{self.name}/r2"] = 1 - residual / spread.clamp(min=1e-12)
+        with torch.no_grad():
+            with_centers = ho.structure_index[ho.centers].unique()
+            diag[f"{self.name}/cap_fraction"] = ho.teacher_cap_fraction[
+                with_centers
+            ].mean()
         diag[f"{self.name}/floor"] = floor.detach()
         diag[f"{self.name}/loss"] = loss.detach()
         diag[f"{self.name}/active"] = loss.new_tensor(on)

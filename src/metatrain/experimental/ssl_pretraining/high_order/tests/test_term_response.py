@@ -102,6 +102,21 @@ def test_one_sided_teacher_runs(step_data_one_sided):
     assert all(torch.isfinite(v) for v in diag.values())
 
 
+def test_centre_count_and_cap_fraction_monitors(step_data, tiny_step_data):
+    ho = step_data.extras["high_order"]
+    _, diag = _term(step_data)(step_data)
+    assert float(diag[f"{NAME}/n_centers"]) == ho.centers.numel()
+    assert 0.0 <= float(diag[f"{NAME}/cap_fraction"]) <= 1.0
+    # mean over the structures that have a centre
+    with_centers = ho.structure_index[ho.centers].unique()
+    expected = ho.teacher_cap_fraction[with_centers].mean()
+    torch.testing.assert_close(diag[f"{NAME}/cap_fraction"], expected)
+    # without centres: the count is reported (0), the fraction is not
+    _, diag = _term(tiny_step_data)(tiny_step_data)
+    assert float(diag[f"{NAME}/n_centers"]) == 0.0
+    assert f"{NAME}/cap_fraction" not in diag
+
+
 def test_no_centers_gives_zero(tiny_step_data):
     assert tiny_step_data.extras["high_order"].centers.numel() == 0
     term = _term(tiny_step_data)
@@ -294,6 +309,8 @@ def _synthetic_step(n, seed=0):
         rotations=rotations,
         centers=torch.arange(n),
         center_amplitudes=amplitudes,
+        structure_index=torch.zeros(n, dtype=torch.long),
+        teacher_cap_fraction=torch.zeros(1, dtype=torch.float64),
     )
     mapped = ActionResponseTerm((4, 4), DIM, 8, 1.0, EPS).student_amplitudes(
         types.SimpleNamespace(extras={"high_order": ho}), amplitudes
