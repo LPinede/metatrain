@@ -130,6 +130,9 @@ class DeformationJetsTermHypers(TypedDict):
     """Weight of the term."""
     hidden: PositiveInt = 64
     """Hidden width of the heads."""
+    l_max: Literal[0, 1, 2] = 2
+    """Highest order of the blocks (1 drops the shear block, 0 keeps only the
+    dilation)."""
     head: AnchorHeadHypers = init_with_defaults(AnchorHeadHypers)
     """Form of the heads."""
 

@@ -14,10 +14,10 @@ from metatrain.experimental.ssl_pretraining.documentation import (
     TrainerHypers,
 )
 from metatrain.experimental.ssl_pretraining.high_order.presets import (
-    PENDING_PRESETS,
     PRESETS,
     analytic_terms,
     apply_preset,
+    teacher_terms,
 )
 from metatrain.experimental.ssl_pretraining.objective import grad_jepa_loss
 from metatrain.experimental.ssl_pretraining.terms import TermContext, build_terms
@@ -30,7 +30,14 @@ from metatrain.utils.hypers import init_with_defaults
 NAME = "experimental.ssl_pretraining"
 IMPLEMENTED = sorted(PRESETS)
 ANALYTIC = {"residual_multipole", "deformation_jets", "chirality"}
+TEACHER = {"rotation_conditioned_latent", "action_response"}
+FULL = ANALYTIC | TEACHER | {"vicreg"}
 EXPECTED_TERMS = {
+    "high_order": FULL,
+    "high_order_truncated_l1": FULL,
+    "high_order_no_response": FULL - {"action_response"},
+    "high_order_shuffled_response": FULL,
+    "high_order_so3": FULL - {"chirality"},
     "high_order_analytic_only": ANALYTIC | {"vicreg"},
     "high_order_edge_heads": ANALYTIC | {"vicreg"},
     "high_order_dedicated_channels": ANALYTIC | {"vicreg"},
@@ -40,7 +47,16 @@ EXPECTED_TERMS = {
     "invariant_jepa": {"rotation_conditioned_latent", "vicreg"},
 }
 # the presets whose terms read the antithetic teacher pair
-TEACHER_PAIR = {"invariant_jepa"}
+TEACHER_PAIR = {
+    "invariant_jepa",
+    "high_order",
+    "high_order_truncated_l1",
+    "high_order_no_response",
+    "high_order_shuffled_response",
+    "high_order_so3",
+}
+# the presets that write the rotation group
+ROTATION_GROUP = {"high_order_so3": "SO3"}
 
 
 def _defaults() -> dict:
@@ -56,20 +72,26 @@ def _active(hypers: dict) -> set:
     return {k for k, v in hypers["objective"]["terms"].items() if v is not None}
 
 
-def _context(core) -> TermContext:
+def _context(core, rotation_group: str = "O3") -> TermContext:
     n = core.num_readout_layers
     return TermContext(
         dims=(n * core.d_node, n * core.d_pet),
         cutoff=4.0,
         atomic_types=[1, 6, 7, 8],
         num_probes=2,
+        rotation_group=rotation_group,
         feature_dim=n * (core.d_node + core.d_pet),
     )
 
 
+def _built(preset: str, core) -> dict:
+    hypers = _hypers(preset)
+    context = _context(core, hypers["rotation_group"])
+    return {t.name: t for t in build_terms(hypers["objective"]["terms"], context)}
+
+
 def test_implemented_presets():
     assert set(IMPLEMENTED) == set(EXPECTED_TERMS)
-    assert not set(PRESETS) & set(PENDING_PRESETS)
 
 
 @pytest.mark.parametrize("preset", IMPLEMENTED)
@@ -129,12 +151,6 @@ def test_apply_preset_keeps_the_other_base_keys():
     assert hypers["num_probes"] == 5
 
 
-@pytest.mark.parametrize("preset", PENDING_PRESETS)
-def test_presets_with_teacher_terms_are_pending(preset):
-    with pytest.raises(NotImplementedError, match="H9"):
-        apply_preset(preset, _defaults())
-
-
 def test_unknown_preset_rejected():
     with pytest.raises(ValueError, match="unknown preset 'nope'"):
         apply_preset("nope", _defaults())
@@ -147,6 +163,59 @@ def test_family_weights_set_the_term_weights():
     assert terms["chirality"]["weight"] == 1.0
     default = analytic_terms()
     assert default["chirality"]["weight"] == pytest.approx(0.1)
+    teacher = teacher_terms(teacher_weight=2.0)
+    assert set(teacher) == TEACHER
+    assert all(entry["weight"] == 2.0 for entry in teacher.values())
+
+
+def test_full_preset_reads_the_teacher_pair_with_both_teacher_terms(pet_core):
+    hypers = _hypers("high_order")
+    assert hypers["high_order"]["teacher_pair"] is True
+    assert hypers["high_order"]["second_rotation"] is False
+    terms = _built("high_order", pet_core)
+    assert terms["rotation_conditioned_latent"].l_max == 4
+    assert terms["rotation_conditioned_latent"].active_l_max == 2
+    assert set(terms["action_response"].heads) == {"dilation", "rotation", "shear"}
+    assert not terms["action_response"].shuffle_amplitudes
+
+
+def test_truncated_variant_caps_every_order_at_one(pet_core):
+    terms = _built("high_order_truncated_l1", pet_core)
+    assert terms["residual_multipole"].l_max == 1
+    assert terms["rotation_conditioned_latent"].l_max == 1
+    assert set(terms["deformation_jets"].heads) == {
+        "displacement",
+        "dilation",
+        "rotation",
+    }
+    assert set(terms["action_response"].heads) == {"dilation", "rotation"}
+
+
+def test_response_variants_differ_from_the_full_preset_only_in_d5():
+    full = _hypers("high_order")
+    for preset, response in [
+        ("high_order_no_response", None),
+        (
+            "high_order_shuffled_response",
+            {
+                **full["objective"]["terms"]["action_response"],
+                "shuffle_amplitudes": True,
+            },
+        ),
+    ]:
+        hypers = _hypers(preset)
+        assert hypers["objective"]["terms"].pop("action_response") == response
+        expected = copy.deepcopy(full)
+        expected["objective"]["terms"].pop("action_response")
+        assert hypers == expected
+
+
+def test_so3_variant_drops_chirality_and_the_pseudo_heads(pet_core):
+    hypers = _hypers("high_order_so3")
+    assert hypers["rotation_group"] == "SO3"
+    terms = _built("high_order_so3", pet_core)
+    assert "chirality" not in terms
+    assert all(s == 1 for _, s in terms["rotation_conditioned_latent"].head_keys)
 
 
 def test_head_options_reach_the_heads(pet_core):
@@ -201,7 +270,8 @@ def test_preset_trains_one_step(preset, small_batch, pet_core, small_teacher):
     hypers = apply_preset(preset, base)
     hypers["atomic_types"] = base["atomic_types"]
     check_hypers(hypers, options.cutoff)
-    terms = build_terms(hypers["objective"]["terms"], _context(pet_core))
+    context = _context(pet_core, hypers["rotation_group"])
+    terms = build_terms(hypers["objective"]["terms"], context)
     assert {t.name for t in terms} == EXPECTED_TERMS[preset]
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -309,7 +379,10 @@ def test_rotation_terms_need_student_rotations(preset, term):
 
 
 @pytest.mark.parametrize("preset", IMPLEMENTED)
-def test_preset_does_not_write_the_rotation_group(preset):
+def test_preset_writes_the_rotation_group_only_if_it_needs_one(preset):
+    if preset in ROTATION_GROUP:
+        assert PRESETS[preset]["rotation_group"] == ROTATION_GROUP[preset]
+        return
     assert "rotation_group" not in PRESETS[preset]
     hypers = apply_preset(preset, {"rotation_group": "SO3"})
     assert hypers["rotation_group"] == "SO3"
@@ -401,18 +474,18 @@ def test_dump_validates_and_survives_the_merge(preset, tmp_path):
     check_hypers(merged["training"], cutoff=4.0)
 
 
-def test_dump_without_base_and_with_a_pending_preset(tmp_path):
-    assert _dump(tmp_path, "high_order_sigreg") == apply_preset("high_order_sigreg", {})
+def test_dump_without_base_and_with_an_unknown_preset(tmp_path):
+    assert _dump(tmp_path, "high_order") == apply_preset("high_order", {})
     result = subprocess.run(
         [
             sys.executable,
             "-m",
             "metatrain.experimental.ssl_pretraining.high_order.presets",
             "dump",
-            "high_order",
+            "nope",
         ],
         capture_output=True,
         text=True,
     )
     assert result.returncode != 0
-    assert "teacher terms" in result.stderr
+    assert "unknown preset 'nope'" in result.stderr

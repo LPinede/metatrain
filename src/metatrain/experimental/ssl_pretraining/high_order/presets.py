@@ -1,8 +1,8 @@
 """Named configurations of the high-order SSL method.
 
 A preset is a nested override of the trainer hypers (``views``, ``high_order`` and
-``objective.terms``; ``rotation_group`` keeps the trainer default), applied with
-:func:`apply_preset`.
+``objective.terms``; ``rotation_group`` keeps the trainer default except in
+``high_order_so3``), applied with :func:`apply_preset`.
 There is no ``preset`` hyperparameter: write the result of :func:`apply_preset` into
 the ``architecture.training`` section of the options file.
 
@@ -15,7 +15,16 @@ The term entries are the only settings of the terms. The two family weights of t
 method are preset-level helpers that write the ``weight`` of each term:
 ``analytic_weight`` (:func:`analytic_terms`) sets the weights of
 ``residual_multipole`` and ``deformation_jets`` and, times ``chirality_weight``, of
-``chirality``. ``teacher_weight`` will do the same for the teacher terms.
+``chirality``; ``teacher_weight`` (:func:`teacher_terms`) sets the weights of
+``rotation_conditioned_latent`` (C) and ``action_response`` (D5).
+
+``high_order`` is the full method: A, B, chirality, C and D5 with VICReg, on the
+antithetic teacher pair. Its variants: ``high_order_truncated_l1`` (every target
+truncated to order 1: A and C at ``l_max: 1``, B and D5 without their shear block),
+``high_order_no_response`` (D5 off, teacher pair still built),
+``high_order_shuffled_response`` (D5 with the amplitudes permuted across centres)
+and ``high_order_so3`` (``rotation_group: SO3``, so no pseudo heads in C, and no
+chirality).
 
 ``invariant_jepa`` is the invariant-JEPA baseline of the method: the
 ``rotation_conditioned_latent`` term at ``l_max: 0`` (an invariant prediction of
@@ -61,6 +70,7 @@ from ..documentation import (
     VICRegTermHypers,
 )
 from .documentation import (
+    ActionResponseTermHypers,
     ChiralityTermHypers,
     DeformationJetsTermHypers,
     EquivariantVicregTermHypers,
@@ -107,19 +117,58 @@ def analytic_terms(
     return terms
 
 
+def teacher_terms(
+    teacher_weight: float = 1.0,
+    head: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """The entries of the teacher terms (C and D5), with their defaults.
+
+    .. code-block:: python
+
+        terms = teacher_terms(teacher_weight=0.5)
+
+    :param teacher_weight: Family weight: the weight of
+        ``rotation_conditioned_latent`` and ``action_response``.
+    :param head: Overrides of the head form, applied to the heads of both terms.
+    :return: The two term entries, by name.
+    """
+    terms = {
+        "rotation_conditioned_latent": _defaults(RotationConditionedLatentTermHypers),
+        "action_response": _defaults(ActionResponseTermHypers),
+    }
+    for entry in terms.values():
+        entry["weight"] = teacher_weight
+        entry["head"].update(head or {})
+    return terms
+
+
+def _full(**over: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """The terms of the full method (A, B, chirality, C, D5 and VICReg), with
+    ``over`` merged into the term entries (``None`` disables a term)."""
+    terms: Dict[str, Any] = {**analytic_terms(), **teacher_terms(), **_vicreg()}
+    for name, value in over.items():
+        if value is None:
+            terms.pop(name)
+        else:
+            terms[name].update(value)
+    return terms
+
+
 def _preset(
     terms: Dict[str, Dict[str, Any]],
     second_rotation: bool = False,
+    rotation_group: Optional[str] = None,
     **high_order: Any,
 ) -> Dict[str, Any]:
     """A preset on the high-order views with the teacher pair off (unless
     ``high_order`` says otherwise) and ``terms`` as the active terms; every other
-    term is disabled. ``high_order`` overrides further view settings."""
+    term is disabled. ``high_order`` overrides further view settings, and
+    ``rotation_group`` (if given) the trainer's rotation group."""
     all_terms: Dict[str, Optional[Dict[str, Any]]] = {
         name: None for name in TermsHypers.__annotations__
     }
     all_terms.update(terms)
-    return {
+    preset: Dict[str, Any] = {
         "views": {"builder": "high_order"},
         # the anchors do not read the antithetic teacher pair
         "high_order": {
@@ -129,6 +178,9 @@ def _preset(
         },
         "objective": {"terms": all_terms},
     }
+    if rotation_group is not None:
+        preset["rotation_group"] = rotation_group
+    return preset
 
 
 def _vicreg() -> Dict[str, Dict[str, Any]]:
@@ -136,6 +188,29 @@ def _vicreg() -> Dict[str, Dict[str, Any]]:
 
 
 PRESETS: Dict[str, Dict[str, Any]] = {
+    # the full method: A, B, chirality, C (curriculum from order 2 up to 4) and D5,
+    # plus VICReg, on the antithetic teacher pair
+    "high_order": _preset(_full(), teacher_pair=True),
+    # every target truncated to order 1 (same terms and teacher pair)
+    "high_order_truncated_l1": _preset(
+        _full(
+            residual_multipole={"l_max": 1},
+            deformation_jets={"l_max": 1},
+            rotation_conditioned_latent={"l_max": 1},
+            action_response={"l_max": 1},
+        ),
+        teacher_pair=True,
+    ),
+    # no response term (the teacher pair is still built, for C)
+    "high_order_no_response": _preset(_full(action_response=None), teacher_pair=True),
+    # the response term with the amplitudes permuted across centres (control)
+    "high_order_shuffled_response": _preset(
+        _full(action_response={"shuffle_amplitudes": True}), teacher_pair=True
+    ),
+    # proper rotations only: no pseudo heads in C, no chirality
+    "high_order_so3": _preset(
+        _full(chirality=None), rotation_group="SO3", teacher_pair=True
+    ),
     # A, B and chirality with pooled per-block heads, plus VICReg
     "high_order_analytic_only": _preset({**analytic_terms(), **_vicreg()}),
     # Abbott et al.'s full per-block heads (node part plus per-edge part)
@@ -184,16 +259,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
 }
 """The implemented presets, by name."""
 
-PENDING_PRESETS = (
-    "high_order",
-    "high_order_truncated_l1",
-    "high_order_no_response",
-    "high_order_shuffled_response",
-    "high_order_so3",
-)
-"""The presets that need the action-response teacher term (task H9);
-:func:`apply_preset` rejects them until it exists."""
-
 
 def _merge(base: Dict[str, Any], override: Dict[str, Any]) -> None:
     """Merge ``override`` into ``base`` in place; ``None`` and non-dict values
@@ -219,14 +284,8 @@ def apply_preset(name: str, base_hypers: Dict[str, Any]) -> Dict[str, Any]:
     :param name: The preset name (a key of :data:`PRESETS`).
     :param base_hypers: The trainer hypers to start from.
     :return: The trainer hypers with the preset applied.
-    :raises NotImplementedError: For a preset that needs the action-response term.
     :raises ValueError: For an unknown preset.
     """
-    if name in PENDING_PRESETS:
-        raise NotImplementedError(
-            f"preset '{name}' needs the teacher terms (the action-response term, "
-            "task H9, does not exist yet)"
-        )
     if name not in PRESETS:
         raise ValueError(
             f"unknown preset '{name}' (available: {', '.join(sorted(PRESETS))})"
@@ -262,7 +321,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         base = yaml.safe_load(args.base.read_text()) or {}
     try:
         hypers = apply_preset(args.preset, base)
-    except (NotImplementedError, ValueError) as error:
+    except ValueError as error:
         parser.error(str(error))
     text = yaml.safe_dump(hypers, sort_keys=False)
     if args.output is None:

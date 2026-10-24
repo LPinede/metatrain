@@ -245,6 +245,7 @@ class DeformationJetTerm(torch.nn.Module):
     :param hidden: Hidden width of the heads.
     :param weight: Weight of the term.
     :param head_kwargs: Keyword arguments of every :class:`BlockHead`.
+    :param l_max: Highest order of the blocks (1 drops the shear block).
     """
 
     name = "deformation_jets"
@@ -264,14 +265,16 @@ class DeformationJetTerm(torch.nn.Module):
         hidden: int,
         weight: float,
         head_kwargs: Optional[Dict[str, Any]] = None,
+        l_max: int = 2,
     ) -> None:
         super().__init__()
         self.weight = weight
         self.required_targets: dict = {}
+        self.blocks = {k: v for k, v in self.BLOCKS.items() if v[0] <= l_max}
         self.heads = torch.nn.ModuleDict(
             {
                 block: BlockHead(dims, l, 1, hidden, **(head_kwargs or {}))
-                for block, (l, _) in self.BLOCKS.items()
+                for block, (l, _) in self.blocks.items()
             }
         )
         self.norm = BlockNormalizer()
@@ -291,7 +294,8 @@ class DeformationJetTerm(torch.nn.Module):
         """The targets, ``(n_sites, 2l+1, 1)`` per block."""
         ho: HighOrderExtras = step.extras["high_order"]
         sites = self._sites(ho)
-        return jet_targets(ho.u_student[sites], ho.grad_smooth[sites])
+        targets = jet_targets(ho.u_student[sites], ho.grad_smooth[sites])
+        return {block: targets[block] for block in self.blocks}
 
     def predict(self, step: StepData) -> Dict[str, torch.Tensor]:
         """The predictions, back-mapped to the teacher frame."""
@@ -303,7 +307,7 @@ class DeformationJetTerm(torch.nn.Module):
             block: back_map(
                 self.heads[block](tokens), irrep_matrix(rotations, l, sigma)
             )
-            for block, (l, sigma) in self.BLOCKS.items()
+            for block, (l, sigma) in self.blocks.items()
         }
 
     def forward(self, step: StepData) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -314,7 +318,7 @@ class DeformationJetTerm(torch.nn.Module):
             _block_loss(
                 self.norm, f"{self.name}/{block}", preds[block], targets[block], diag
             )
-            for block in self.BLOCKS
+            for block in self.blocks
         ]
         loss = torch.stack(losses).mean()
         diag[f"{self.name}/loss"] = loss.detach()
