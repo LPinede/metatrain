@@ -1,4 +1,5 @@
 import csv
+import io
 import json
 import logging
 import re
@@ -165,6 +166,56 @@ def test_csv_file_handler_aligns_rows_with_changing_keys(monkeypatch, tmp_path):
         ["2", "4", "6", "5"],
     ]
     handler.close()
+
+
+def test_csv_file_handler_unchanged_keys_give_the_plain_csv(tmp_path):
+    """With the same keys on every row, the file is the header, the units and the
+    rows, written by ``csv.writer`` (byte for byte the output of the handler before
+    it aligned rows by key)."""
+    log_file = tmp_path / "log.csv"
+    handler = CSVFileHandler(filename=log_file, encoding="utf-8")
+    keys, units = ["Epoch", "loss", "ångstrom"], ["", "eV", "Å"]
+    rows = [["0", "1.0", "2"], ["1", "0.5", "3"], ["2", "0.25", "4"]]
+    for values in rows:
+        handler.emit_data(keys, values, units)
+    handler.close()
+    expected = io.StringIO(newline="")
+    writer = csv.writer(expected)
+    for line in [keys, units, *rows]:
+        writer.writerow(line)
+    assert log_file.read_bytes() == expected.getvalue().encode("utf-8")
+
+
+def test_csv_file_handler_resume_keeps_the_earlier_rows(tmp_path):
+    """A second handler on an existing file (a resumed run) appends under the
+    existing header, and a later new key rewrites the file with every earlier
+    row, those of the first session included."""
+    log_file = tmp_path / "log.csv"
+    first = CSVFileHandler(filename=log_file, encoding="utf-8")
+    first.emit_data(["Epoch", "a"], ["0", "1"], ["", "eV"])
+    first.emit_data(["Epoch", "a"], ["1", "2"], ["", "eV"])
+    first.close()
+
+    second = CSVFileHandler(filename=log_file, encoding="utf-8")
+    second.emit_data(["Epoch", "a"], ["2", "3"], ["", "eV"])
+    assert read_csv(log_file) == [
+        ["Epoch", "a"],
+        ["", "eV"],
+        ["0", "1"],
+        ["1", "2"],
+        ["2", "3"],
+    ]
+    second.emit_data(["Epoch", "a", "b"], ["3", "4", "5"], ["", "eV", "s"])
+    second.close()
+    assert read_csv(log_file) == [
+        ["Epoch", "a", "b"],
+        ["", "eV", "s"],
+        ["0", "1", "nan"],
+        ["1", "2", "nan"],
+        ["2", "3", "nan"],
+        ["3", "4", "5"],
+    ]
+    assert not (tmp_path / "log.csv.tmp").exists()
 
 
 def test_csv_file_handler_emit_does_nothing(monkeypatch, tmp_path):

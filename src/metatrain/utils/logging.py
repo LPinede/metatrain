@@ -3,6 +3,7 @@
 import contextlib
 import csv
 import logging
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -45,11 +46,35 @@ class CSVFileHandler(logging.FileHandler):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._header_written = False
-        # the columns, their units and the rows written so far (to rewrite the
-        # file when a new column appears)
+        # the columns, their units and every row of the file (to rewrite it when a
+        # new column appears); read from an existing file on the first write
         self._keys: List[str] = []
         self._units: Dict[str, str] = {}
         self._rows: List[Dict[str, str]] = []
+        self._loaded = False
+
+    def _load_existing(self) -> None:
+        """Read the header, units and rows of a non-empty file opened for appending
+        (a resumed run), so that later writes keep them."""
+        self._loaded = True
+        path = Path(self.baseFilename)
+        if "a" not in self.mode or not path.exists() or path.stat().st_size == 0:
+            return
+        with open(path, newline="", encoding=self.encoding) as file:
+            rows = list(csv.reader(file))
+        header = rows[0]
+        units = rows[1] if len(rows) > 1 else [""] * len(header)
+        self._keys = list(header)
+        self._units = dict(zip(header, units, strict=False))
+        skip_units = False
+        for row in rows[2:]:
+            if skip_units:  # the units row of a repeated header
+                skip_units = False
+            elif row == header:
+                skip_units = True
+            else:
+                self._rows.append(dict(zip(header, row, strict=False)))
+        self._header_written = True
 
     def _open(self) -> Any:
         # Open with newline='' so that csv.writer controls line endings
@@ -73,16 +98,20 @@ class CSVFileHandler(logging.FileHandler):
     def emit_data(self, keys: List[str], values: List[str], units: List[str]) -> None:
         """Write structured data to the CSV file.
 
-        ``keys`` and ``units`` are written only the first time this methods is called.
-        Each value goes under the column of its key: a column without a value in
-        this row gets ``nan``, and a key that is not yet a column adds one (the file
-        is then rewritten with the extended header).
+        ``keys`` and ``units`` are written only the first time this methods is called
+        (not at all when appending to an existing file, whose header and rows are
+        kept). Each value goes under the column of its key: a column without a value
+        in this row gets ``nan``, and a key that is not yet a column adds one (the
+        file is then rewritten atomically, every earlier row under the extended
+        header).
 
         :param keys: Column header names
         :param values: Data values to write
         :param units: Units for each column
         """
         _validate_length(keys, values, units)
+        if not self._loaded:
+            self._load_existing()
         row = dict(zip(keys, values, strict=True))
         new_keys = [key for key in keys if key not in self._units]
         for key, unit in zip(keys, units, strict=True):
@@ -91,15 +120,18 @@ class CSVFileHandler(logging.FileHandler):
         self._rows.append(row)
 
         if self._header_written and len(new_keys) > 0:
-            # rewrite the rows written so far under the extended header
-            with open(
-                self.baseFilename, "w", encoding=self.encoding, newline=""
-            ) as file:
+            # rewrite every row under the extended header, atomically
+            if self.stream is not None:
+                self.stream.close()
+                self.stream = None  # type: ignore[assignment]
+            temporary = self.baseFilename + ".tmp"
+            with open(temporary, "w", encoding=self.encoding, newline="") as file:
                 writer = csv.writer(file)
                 writer.writerow(self._keys)
                 writer.writerow([self._units[key] for key in self._keys])
                 for previous in self._rows:
                     writer.writerow([previous.get(key, "nan") for key in self._keys])
+            os.replace(temporary, self.baseFilename)
             return
 
         with self._open() as file:
