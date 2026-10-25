@@ -51,9 +51,11 @@ from .high_order.documentation import (
     EquivariantVicregTermHypers,
     HighOrderHypers,
     NonNegativeFloat,
+    PositionalSmoothnessTermHypers,
     PositiveFloat,
     PositiveInt,
     ResidualMultipoleTermHypers,
+    RotationalSmoothnessTermHypers,
     RotationAveragedVicregTermHypers,
     RotationConditionedLatentTermHypers,
 )
@@ -219,6 +221,12 @@ class TermsHypers(TypedDict):
     action_response: NotRequired[Optional[ActionResponseTermHypers]] = None
     """High-order method, term D5: response of the teacher to the teacher modes at
     the mode centres, predicted from the student tokens and the mode amplitudes."""
+    rotational_smoothness: NotRequired[Optional[RotationalSmoothnessTermHypers]] = None
+    """High-order views: smoothness of the features under a small extra rotation
+    (needs ``high_order.smooth_rotation``)."""
+    positional_smoothness: NotRequired[Optional[PositionalSmoothnessTermHypers]] = None
+    """High-order views: smoothness of the features under a small displacement
+    (needs ``high_order.smooth_displacement``)."""
 
 
 def _at_least_one_term(terms: dict) -> dict:

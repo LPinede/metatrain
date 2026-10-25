@@ -23,7 +23,14 @@ and the collapse regularizers that need the second student rotation
 - ``equivariant_vicreg``: VICReg between the back-mapped outputs of a linear
   projector on two rotations of the same student input, per irrep block;
 - ``vicreg_averaged``: the shared VICReg on the features averaged over the two
-  rotations.
+  rotations;
+
+and the smoothness terms that read the small extra student views
+(``high_order.smooth_rotation`` / ``smooth_displacement``), companions of the
+anti-collapse term that make orientation noise and hypersensitivity to tiny
+displacements expensive without forbidding any order:
+
+- ``rotational_smoothness`` and ``positional_smoothness``.
 
 Every anchor predicts its irrep blocks ``(l, sigma)`` with per-block heads on the
 student tokens, maps them back to the teacher frame with ``D^(l,sigma)(g_S)^T``
@@ -661,6 +668,79 @@ class RotationAveragedVicregTerm:
         }
 
 
+class _SmoothnessTerm:
+    """``weight`` times the mean squared change of the layer-normalized pooled student
+    features at the visible atoms between the student view and the extra student view
+    ``view``, divided by the square of the perturbation size
+    ``high_order.<option>``."""
+
+    name = ""
+    view = ""
+    option = ""
+    needs_gradients = False
+    uses_prediction = False
+
+    def __init__(self, weight: float = 0.01) -> None:
+        self.weight = weight
+        self.required_targets: dict = {}
+
+    def __call__(self, step: StepData) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        tokens = step.extras.get("student_tokens_extra", {})
+        if self.view not in tokens:
+            raise ValueError(f"the '{self.name}' term needs `high_order.{self.option}`")
+        rows = ~step.views.masked
+        a = _pooled(step.extras["student_tokens"].select(rows))
+        b = _pooled(tokens[self.view].select(rows))
+        a = torch.nn.functional.layer_norm(a, a.shape[-1:])
+        b = torch.nn.functional.layer_norm(b, b.shape[-1:])
+        size = float(step.hypers["high_order"][self.option])
+        loss = (a - b).pow(2).mean() / size**2
+        return self.weight * loss, {f"{self.name}/loss": loss.detach()}
+
+
+class RotationalSmoothnessTerm(_SmoothnessTerm):
+    """Smoothness under the small extra rotation of ``high_order.smooth_rotation``:
+    an order-l orientation dependence costs about l(l+1) times its power.
+
+    .. code-block:: python
+
+        term = RotationalSmoothnessTerm(weight=0.01)
+        loss, diagnostics = term(step)
+
+    :param weight: Weight of the term.
+    """
+
+    name = "rotational_smoothness"
+    view = "rot_small"
+    option = "smooth_rotation"
+
+
+class PositionalSmoothnessTerm(_SmoothnessTerm):
+    """Smoothness under the small iid displacement of
+    ``high_order.smooth_displacement``: no hypersensitivity to tiny displacements.
+
+    .. code-block:: python
+
+        term = PositionalSmoothnessTerm(weight=0.01)
+        loss, diagnostics = term(step)
+
+    :param weight: Weight of the term.
+    """
+
+    name = "positional_smoothness"
+    view = "disp_small"
+    option = "smooth_displacement"
+
+
+def _comparison_probes(
+    step: StepData, feature_dim: int, full_vector: bool, like: torch.Tensor
+) -> torch.Tensor:
+    """The step's probes, or the identity (the full-vector comparison)."""
+    if full_vector:
+        return torch.eye(feature_dim, dtype=like.dtype, device=like.device)
+    return step.probes.to(like)
+
+
 def _spread(x: torch.Tensor) -> torch.Tensor:
     """The norm of ``x`` centred over the batch (per column)."""
     if x.shape[0] == 0:
@@ -743,6 +823,7 @@ class RotationConditionedLatentTerm(torch.nn.Module):
     :param floor_gamma: Weight of the floors of the ``l > 0`` block contributions.
     :param warmup_fraction: Fraction of the steps with ``L = 0``.
     :param head_kwargs: Keyword arguments of every :class:`BlockHead`.
+    :param full_vector: Compare the full latent instead of its probe contraction.
     """
 
     name = "rotation_conditioned_latent"
@@ -763,8 +844,10 @@ class RotationConditionedLatentTerm(torch.nn.Module):
         floor_gamma: float = 0.1,
         warmup_fraction: float = 0.05,
         head_kwargs: Optional[Dict[str, Any]] = None,
+        full_vector: bool = False,
     ) -> None:
         super().__init__()
+        self.feature_dim, self.full_vector = feature_dim, full_vector
         if rotation_group not in ("O3", "SO3", "none"):
             raise ValueError(f"unknown rotation group '{rotation_group}'")
         if rotation_group == "none":
@@ -857,7 +940,8 @@ class RotationConditionedLatentTerm(torch.nn.Module):
             # ``Views.teacher`` is the plus view of the antithetic pair
             teacher = 0.5 * (teacher + extra["minus"])
         atoms = step.views.latent_targets
-        return (teacher @ step.probes.T.to(teacher))[atoms]
+        probes = _comparison_probes(step, self.feature_dim, self.full_vector, teacher)
+        return (teacher @ probes.T)[atoms]
 
     def order(self) -> int:
         """The highest order used now (0 during the warm-up)."""
@@ -887,7 +971,8 @@ class RotationConditionedLatentTerm(torch.nn.Module):
             matrices = irrep_matrix(rotations, l, sigma).to(a)
             # <D, A> per rank channel, then W v_p (probes contracted into W first)
             rotated = torch.einsum("nmq,nmqk->nk", matrices, a)
-            probed = step.probes.to(a) @ self.maps[name].weight  # (P, rank)
+            probes = _comparison_probes(step, self.feature_dim, self.full_vector, a)
+            probed = probes @ self.maps[name].weight  # (P, rank)
             out[(l, sigma)] = rotated @ probed.T
         return out
 
@@ -1019,6 +1104,7 @@ class ActionResponseTerm(torch.nn.Module):
     :param floor_gamma: Weight of the floors of the rotation and shear contributions.
     :param warmup_fraction: Fraction of the steps with the term off.
     :param head_kwargs: Keyword arguments of every :class:`BlockHead`.
+    :param full_vector: Compare the full response instead of its probe contraction.
     """
 
     name = "action_response"
@@ -1042,8 +1128,10 @@ class ActionResponseTerm(torch.nn.Module):
         floor_gamma: float = 0.1,
         warmup_fraction: float = 0.05,
         head_kwargs: Optional[Dict[str, Any]] = None,
+        full_vector: bool = False,
     ) -> None:
         super().__init__()
+        self.feature_dim, self.full_vector = feature_dim, full_vector
         self.weight, self.mode_amplitude, self.rank = weight, mode_amplitude, rank
         self.shuffle_amplitudes, self.floor_gamma = shuffle_amplitudes, floor_gamma
         self.warmup_fraction = warmup_fraction
@@ -1092,7 +1180,8 @@ class ActionResponseTerm(torch.nn.Module):
     def teacher_frame_targets(self, step: StepData) -> torch.Tensor:
         """The probe-contracted responses at the centres, ``(n_c, num_probes)``."""
         delta, _ = self.responses(step)
-        return delta @ step.probes.T.to(delta)
+        probes = _comparison_probes(step, self.feature_dim, self.full_vector, delta)
+        return delta @ probes.T
 
     def amplitudes(self, step: StepData) -> torch.Tensor:
         """The teacher-frame amplitudes of the centres, ``(n_c, 9)``, permuted
@@ -1140,8 +1229,13 @@ class ActionResponseTerm(torch.nn.Module):
         """The probe contraction ``v_p . (<a_S, A> W)`` of each block,
         ``(n_c, num_probes)``, with ``v_p`` contracted into ``W`` first."""
         out = {}
+        probes = None
         for block, part in rank_parts.items():
-            probed = step.probes.to(part) @ self.maps[block].weight  # (P, rank)
+            if probes is None:
+                probes = _comparison_probes(
+                    step, self.feature_dim, self.full_vector, part
+                )
+            probed = probes @ self.maps[block].weight  # (P, rank)
             out[block] = part @ probed.T
         return out
 

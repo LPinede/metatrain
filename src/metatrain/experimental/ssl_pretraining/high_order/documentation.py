@@ -85,6 +85,15 @@ class HighOrderHypers(TypedDict):
     second_rotation: bool = False
     """Whether a second student rotation is encoded (equivariant or averaged
     VICReg)."""
+    smooth_rotation: NonNegativeFloat = 0.0
+    """Angle (radians) of a small extra rotation, about a random axis, of the
+    student input, encoded as an extra student view for ``rotational_smoothness``
+    (0: not encoded)."""
+    smooth_displacement: NonNegativeFloat = 0.0
+    """Standard deviation (per Cartesian component, length units) of an iid
+    displacement of the student input, encoded as an extra student view for
+    ``positional_smoothness`` (0: not encoded); the total displacement of each atom
+    from the clean structure stays below ``noise.skin / 2``."""
 
 
 def _three_distinct(value: list) -> list:
@@ -185,6 +194,30 @@ class RotationAveragedVicregTermHypers(TypedDict):
     """Weight of the covariance penalty."""
 
 
+class RotationalSmoothnessTermHypers(TypedDict):
+    """``rotational_smoothness`` term: ``weight`` times the mean squared change of the
+    layer-normalized pooled student features (visible atoms) under the small extra
+    rotation of ``high_order.smooth_rotation``, divided by its angle squared. An
+    orientation dependence of order l costs about l(l+1) times its power, so every
+    order stays allowed while high-order orientation noise is expensive. Needs
+    ``high_order.smooth_rotation > 0``."""
+
+    weight: NonNegativeFloat = 0.01
+    """Weight of the term."""
+
+
+class PositionalSmoothnessTermHypers(TypedDict):
+    """``positional_smoothness`` term: ``weight`` times the mean squared change of the
+    layer-normalized pooled student features (visible atoms) under the small iid
+    displacement of ``high_order.smooth_displacement``, divided by its standard
+    deviation squared: features may depend on the geometry, but not be
+    hypersensitive to tiny displacements. Needs
+    ``high_order.smooth_displacement > 0``."""
+
+    weight: NonNegativeFloat = 0.01
+    """Weight of the term."""
+
+
 class RotationConditionedLatentTermHypers(TypedDict):
     """``rotation_conditioned_latent`` term (C): predicts the teacher latent of the
     clean structure (the mean over the antithetic teacher pair, else the clean
@@ -218,6 +251,10 @@ class RotationConditionedLatentTermHypers(TypedDict):
     floor_gamma: NonNegativeFloat = 0.1
     """Weight of the per-batch variance floor of each l > 0 block contribution (at
     0.1 target standard deviations)."""
+    full_vector: bool = False
+    """Compare the full teacher latent instead of its contraction with the step's
+    probes (the latent is not a gradient, so the full comparison costs little; the
+    probes discard most of the learning signal)."""
     head: AnchorHeadHypers = init_with_defaults(AnchorHeadHypers)
     """Form of the heads."""
 
@@ -255,5 +292,8 @@ class ActionResponseTermHypers(TypedDict):
     floor_gamma: NonNegativeFloat = 0.1
     """Weight of the per-batch variance floor of the rotation and shear
     contributions (at 0.1 target standard deviations)."""
+    full_vector: bool = False
+    """Compare the full response vector instead of its contraction with the step's
+    probes."""
     head: AnchorHeadHypers = init_with_defaults(AnchorHeadHypers)
     """Form of the heads."""

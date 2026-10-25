@@ -16,6 +16,11 @@
   (same mask, same displacement) under an extra random rotation ``g2`` per
   structure, in ``extras["student_views"]["rot2"]``. Its rotations are drawn after
   every other random number, so the other views do not depend on the option.
+- **Smoothness views** (``high_order.smooth_rotation``, ``smooth_displacement``):
+  the same student input under a small extra rotation about a random axis
+  (``extras["student_views"]["rot_small"]``), or with a small iid displacement
+  (``"disp_small"``, total displacement from the clean structure capped at
+  ``noise.skin / 2``). Drawn after the second rotation, in this order.
 
 Displacements are bounded by ``noise.skin / 2`` per atom, separately for ``u_S`` and
 ``u_T``, so the skin neighbor list stays exact: ``u_T`` is capped per atom, and
@@ -28,6 +33,7 @@ numbers are drawn on CPU from the step generator, then moved to the device and d
 of the positions.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -274,6 +280,32 @@ def _teacher_displacement(
     return u
 
 
+def small_rotations(
+    n: int, angle: float, dtype: torch.dtype, generator: torch.Generator
+) -> torch.Tensor:
+    """Rotations by ``angle`` (radians) about random axes (Rodrigues), ``(n, 3, 3)``,
+    on CPU.
+
+    .. code-block:: python
+
+        rotations = small_rotations(4, 0.1, torch.float64, torch.Generator())
+
+    :param n: Number of rotations.
+    :param angle: Rotation angle.
+    :param dtype: Output dtype.
+    :param generator: CPU random generator of the axes.
+    :return: The rotation matrices.
+    """
+    axis = torch.randn(n, 3, generator=generator, dtype=torch.float64)
+    axis = axis / axis.norm(dim=-1, keepdim=True)
+    k = torch.zeros(n, 3, 3, dtype=torch.float64)
+    k[:, 0, 1], k[:, 0, 2], k[:, 1, 2] = -axis[:, 2], axis[:, 1], -axis[:, 0]
+    k = k - k.transpose(1, 2)
+    eye = torch.eye(3, dtype=torch.float64).expand(n, 3, 3)
+    out = eye + math.sin(angle) * k + (1 - math.cos(angle)) * k @ k
+    return out.to(dtype)
+
+
 def build_high_order_views(
     systems: List[System],
     options: NeighborListOptions,
@@ -316,8 +348,10 @@ def build_high_order_views(
 
     student: List[System] = []
     # per structure: the displaced positions, cell and kept pairs of the student
-    # view, before its rotation (for the second rotation)
-    student_inputs: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    # view, before its rotation, and the clean positions (for the extra student views)
+    student_inputs: List[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = []
     teacher: List[System] = []
     extra_teacher: List[System] = []
     per_structure: Dict[str, List[torch.Tensor]] = {}
@@ -405,7 +439,7 @@ def build_high_order_views(
             keep_pairs=keep,
         )
         student.append(student_view)
-        student_inputs.append((positions + u_student, cell, keep))
+        student_inputs.append((positions + u_student, cell, keep, positions))
         student_nl = student_view.get_neighbor_list(options)
         student_distances = student_nl.values.reshape(-1, 3).norm(dim=-1).detach()
         student_close = student_distances < cutoff
@@ -512,7 +546,7 @@ def build_high_order_views(
         ).to(device)
         second: List[System] = []
         rotations2 = []
-        for index, (system, (x, cell, keep)) in enumerate(
+        for index, (system, (x, cell, keep, _)) in enumerate(
             zip(systems, student_inputs, strict=True)
         ):
             rotation = extra_rotations[index] @ rotations[index].to(device)
@@ -528,6 +562,44 @@ def build_high_order_views(
             rotations2.append(rotation.expand(len(system), 3, 3))
         extras.rotations2 = torch.cat(rotations2)
         view_extras["student_views"] = {"rot2": second}
+    if ho["smooth_rotation"] > 0:
+        small = small_rotations(len(systems), ho["smooth_rotation"], dtype, generator)
+        rotated_views: List[System] = []
+        for index, (system, (x, cell, keep, _)) in enumerate(
+            zip(systems, student_inputs, strict=True)
+        ):
+            rotation = small[index].to(device) @ rotations[index].to(device)
+            rotated_views.append(
+                build_view(
+                    system,
+                    options,
+                    (x @ rotation.T).requires_grad_(position_gradients),
+                    cell @ rotation.T,
+                    keep_pairs=keep,
+                )
+            )
+        view_extras.setdefault("student_views", {})["rot_small"] = rotated_views
+    if ho["smooth_displacement"] > 0:
+        moved_views: List[System] = []
+        for index, (system, (x, cell, keep, clean)) in enumerate(
+            zip(systems, student_inputs, strict=True)
+        ):
+            noise = ho["smooth_displacement"] * torch.randn(
+                x.shape, generator=generator, dtype=torch.float64
+            )
+            noise = noise.to(device=device, dtype=dtype)
+            moved = clean + cap_norm(x + noise - clean, max_norm)
+            rotation = rotations[index].to(device)
+            moved_views.append(
+                build_view(
+                    system,
+                    options,
+                    (moved @ rotation.T).requires_grad_(position_gradients),
+                    cell @ rotation.T,
+                    keep_pairs=keep,
+                )
+            )
+        view_extras.setdefault("student_views", {})["disp_small"] = moved_views
     return Views(
         student=student,
         teacher=teacher,
