@@ -21,6 +21,11 @@
   (``extras["student_views"]["rot_small"]``), or with a small iid displacement
   (``"disp_small"``, total displacement from the clean structure capped at
   ``noise.skin / 2``). Drawn after the second rotation, in this order.
+- **Student nudge views** (``high_order.student_nudge``, for ``inverse_response``):
+  the student input displaced both ways by the teacher modes, ``x_S ± g_S u_T``, in
+  ``extras["student_views"]["nudge_plus"]`` and ``["nudge_minus"]`` (total
+  displacement from the clean structure capped at ``noise.skin / 2``). No random
+  numbers are drawn.
 
 Displacements are bounded by ``noise.skin / 2`` per atom, separately for ``u_S`` and
 ``u_T``, so the skin neighbor list stays exact: ``u_T`` is capped per atom, and
@@ -352,6 +357,8 @@ def build_high_order_views(
     student_inputs: List[
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     ] = []
+    # per structure: the capped teacher-mode displacement u_T (for the nudge views)
+    teacher_displacements: List[torch.Tensor] = []
     teacher: List[System] = []
     extra_teacher: List[System] = []
     per_structure: Dict[str, List[torch.Tensor]] = {}
@@ -472,6 +479,7 @@ def build_high_order_views(
             positions, cell, system.pbc, centers, amplitudes, ho["mode_window"]
         )
         u_teacher = cap_norm(u_uncapped, max_norm)
+        teacher_displacements.append(u_teacher)
         cap_fraction = (u_uncapped.norm(dim=-1) > max_norm).to(dtype).mean()
 
         # the main teacher view (the shared teacher pass) and the extra one
@@ -600,6 +608,25 @@ def build_high_order_views(
                 )
             )
         view_extras.setdefault("student_views", {})["disp_small"] = moved_views
+    if ho["student_nudge"]:
+        nudged: Dict[str, List[System]] = {"nudge_plus": [], "nudge_minus": []}
+        for index, (system, (x, cell, keep, clean)) in enumerate(
+            zip(systems, student_inputs, strict=True)
+        ):
+            rotation = rotations[index].to(device)
+            for name, sign in (("nudge_plus", 1.0), ("nudge_minus", -1.0)):
+                u = sign * teacher_displacements[index]
+                moved = clean + cap_norm(x + u - clean, max_norm)
+                nudged[name].append(
+                    build_view(
+                        system,
+                        options,
+                        (moved @ rotation.T).requires_grad_(position_gradients),
+                        cell @ rotation.T,
+                        keep_pairs=keep,
+                    )
+                )
+        view_extras.setdefault("student_views", {}).update(nudged)
     return Views(
         student=student,
         teacher=teacher,

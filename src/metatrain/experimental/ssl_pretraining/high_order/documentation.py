@@ -94,6 +94,11 @@ class HighOrderHypers(TypedDict):
     displacement of the student input, encoded as an extra student view for
     ``positional_smoothness`` (0: not encoded); the total displacement of each atom
     from the clean structure stays below ``noise.skin / 2``."""
+    student_nudge: bool = False
+    """Whether the student input displaced both ways by the teacher modes,
+    ``x_S ± g_S u_T``, is encoded as two extra student views (``inverse_response``);
+    the total displacement of each atom from the clean structure stays below
+    ``noise.skin / 2``."""
 
 
 def _three_distinct(value: list) -> list:
@@ -216,6 +221,25 @@ class PositionalSmoothnessTermHypers(TypedDict):
 
     weight: NonNegativeFloat = 0.01
     """Weight of the term."""
+
+
+class InverseResponseTermHypers(TypedDict):
+    """``inverse_response`` term (inverse D5): an MLP decodes the teacher-mode
+    amplitudes of each centre, in the student frame, from the student's pooled
+    feature ``h0`` and its antithetic response ``Delta`` to the nudge views
+    ``x_S ± g_S u_T``. The target is exact and 9-dimensional, and there is no
+    teacher. Needs ``high_order.student_nudge: true`` and the shared anti-collapse
+    term (about 9 decodable directions satisfy it)."""
+
+    weight: NonNegativeFloat = 1.0
+    """Weight of the term."""
+    hidden: PositiveInt = 128
+    """Hidden width of the decoding MLP."""
+    inputs: Literal["both", "delta"] = "both"
+    """Inputs of the MLP: ``[LN(h0), Delta]`` or ``Delta`` alone (the local rotation
+    can only be decoded with ``h0``)."""
+    warmup_fraction: Probability = 0.0
+    """Fraction of the steps with the term off."""
 
 
 class RotationConditionedLatentTermHypers(TypedDict):

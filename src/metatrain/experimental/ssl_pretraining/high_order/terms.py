@@ -17,6 +17,11 @@ the teacher terms:
   modes at the mode centres, predicted from the mode amplitudes mapped to the
   student frame and compared after a probe contraction;
 
+the student-only response term (``high_order.student_nudge``):
+
+- ``inverse_response`` (inverse D5): the mode amplitudes, in the student frame,
+  decoded from the student's own response to the teacher modes at the centres;
+
 and the collapse regularizers that need the second student rotation
 (``high_order.second_rotation``):
 
@@ -1051,6 +1056,33 @@ class RotationConditionedLatentTerm(torch.nn.Module):
         self.maybe_promote(diagnostics)
 
 
+def student_frame_amplitudes(
+    rotations: torch.Tensor,
+    amplitudes: torch.Tensor,
+    blocks: Mapping[str, Tuple[int, int]],
+) -> Dict[str, torch.Tensor]:
+    """``D^(l,sigma)(g) a`` of each mode block (dilation, rotation, shear),
+    ``(n, 2l+1)`` each.
+
+    .. code-block:: python
+
+        a_s = student_frame_amplitudes(rotations, amplitudes, ActionResponseTerm.BLOCKS)
+
+    :param rotations: Rotations ``(n, 3, 3)``.
+    :param amplitudes: Teacher-frame amplitudes ``(n, 9)`` (columns of
+        :attr:`ActionResponseTerm.SLICES`).
+    :param blocks: ``(l, sigma)`` of each block to map.
+    """
+    out = {}
+    for block, (l, sigma) in blocks.items():
+        a = amplitudes[:, ActionResponseTerm.SLICES[block]]
+        if block == "rotation":
+            a = a[:, list(XYZ_TO_L1)]  # xyz -> the real l=1 order
+        matrices = irrep_matrix(rotations.to(a), l, sigma)
+        out[block] = torch.einsum("nmp,np->nm", matrices, a)
+    return out
+
+
 class ActionResponseTerm(torch.nn.Module):
     """Term D5: the response of the teacher to the windowed l=1 teacher modes at
     the mode centres, predicted from the student tokens and the mode amplitudes.
@@ -1201,15 +1233,9 @@ class ActionResponseTerm(torch.nn.Module):
         :param amplitudes: Teacher-frame amplitudes ``(n_c, 9)``.
         """
         ho = step.extras["high_order"]
-        rotations = ho.rotations[ho.centers]
-        out = {}
-        for block, (l, sigma) in self.blocks.items():
-            a = amplitudes[:, self.SLICES[block]]
-            if block == "rotation":
-                a = a[:, list(XYZ_TO_L1)]  # xyz -> the real l=1 order
-            matrices = irrep_matrix(rotations.to(a), l, sigma)
-            out[block] = torch.einsum("nmp,np->nm", matrices, a)
-        return out
+        return student_frame_amplitudes(
+            ho.rotations[ho.centers], amplitudes, self.blocks
+        )
 
     def rank_contributions(
         self, step: StepData, amplitudes: torch.Tensor
@@ -1299,6 +1325,124 @@ class ActionResponseTerm(torch.nn.Module):
                 with_centers
             ].mean()
         diag[f"{self.name}/floor"] = floor.detach()
+        diag[f"{self.name}/loss"] = loss.detach()
+        diag[f"{self.name}/active"] = loss.new_tensor(on)
+        return self.weight * on * loss, diag
+
+
+class InverseResponseTerm(torch.nn.Module):
+    """Inverse D5: decode the teacher-mode amplitudes from the student's own response.
+
+    At each centre ``c`` the student sees its input ``x_S`` and the two nudge views
+    ``x_S ± g_S u_T`` (``high_order.student_nudge``; ``u_T`` the windowed l=1 modes of
+    the centres, as for D5). With ``h0`` the pooled student feature of ``x_S`` at
+    ``c`` and ``Delta = (h(x_S + g_S u_T) - h(x_S - g_S u_T)) / (2 a0)``
+    (``a0 = high_order.mode_amplitude``), an MLP reads ``[LN(h0), Delta]`` (or
+    ``Delta`` alone, ``inputs="delta"``) and predicts the 9 amplitudes in the
+    student frame, ``D^(l,sigma)(g_S) a / a0`` per block (dilation (0, +), rotation
+    (1, -), shear (2, +)). The loss is ``weight`` times their mean squared error
+    (target variance about 1); gradients reach the backbone through ``h0`` and
+    ``Delta``. There is no teacher: the target is exact and low-dimensional,
+    unlike D5's latent response (toy lab, design study section 3b). The term is
+    off while the training progress is below ``warmup_fraction``.
+
+    It is not an anti-collapse term: a constant representation costs the full
+    target variance, but about 9 decodable directions suffice, so it needs the
+    shared anti-collapse term.
+
+    Monitors: ``r2`` (all amplitudes) and ``r2_<block>``, ``n_centers`` and
+    ``skipped`` (1 on a step with fewer than two centres).
+
+    .. code-block:: python
+
+        term = InverseResponseTerm((256, 256), hidden=128, weight=1.0)
+        loss, diagnostics = term(step)
+
+    :param dims: ``(Dn, De)`` token dimensions.
+    :param hidden: Hidden width of the decoding MLP.
+    :param weight: Weight of the term.
+    :param inputs: ``"both"`` (``[LN(h0), Delta]``) or ``"delta"``.
+    :param warmup_fraction: Fraction of the steps with the term off.
+    """
+
+    name = "inverse_response"
+    needs_gradients = False
+    uses_prediction = False
+
+    def __init__(
+        self,
+        dims: Tuple[int, int],
+        hidden: int = 128,
+        weight: float = 1.0,
+        inputs: str = "both",
+        warmup_fraction: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if inputs not in ("both", "delta"):
+            raise ValueError(f"unknown inputs '{inputs}'")
+        self.weight, self.inputs, self.warmup_fraction = weight, inputs, warmup_fraction
+        self.required_targets: dict = {}
+        feature_dim = dims[0] + dims[1]
+        self.head = torch.nn.Sequential(
+            torch.nn.Linear(feature_dim * (2 if inputs == "both" else 1), hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, 9),
+        )
+
+    @classmethod
+    def from_hypers(
+        cls, hypers: Dict[str, Any], context: TermContext
+    ) -> "InverseResponseTerm":
+        """Build the term from its hypers and the run's context."""
+        return cls(dims=context.dims, **hypers)
+
+    def decode(self, step: StepData) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The decoded and the true student-frame amplitudes at the centres, divided
+        by the mode amplitude, ``(n_c, 9)`` each."""
+        ho: HighOrderExtras = step.extras["high_order"]
+        extra = step.extras.get("student_tokens_extra", {})
+        if "nudge_plus" not in extra:
+            raise ValueError(f"the '{self.name}' term needs `high_order.student_nudge`")
+        amplitude = float(step.hypers["high_order"]["mode_amplitude"])
+        h0 = _pooled(step.extras["student_tokens"].select(ho.centers))
+        plus = _pooled(extra["nudge_plus"].select(ho.centers))
+        minus = _pooled(extra["nudge_minus"].select(ho.centers))
+        delta = (plus - minus) / (2 * amplitude)
+        if self.inputs == "both":
+            x = torch.cat([torch.nn.functional.layer_norm(h0, h0.shape[-1:]), delta], 1)
+        else:
+            x = delta
+        target = student_frame_amplitudes(
+            ho.rotations[ho.centers], ho.center_amplitudes, ActionResponseTerm.BLOCKS
+        )
+        return self.head(x), torch.cat(list(target.values()), 1).to(x) / amplitude
+
+    def forward(self, step: StepData) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        on = float(float(step.extras["step_fraction"]) >= self.warmup_fraction)
+        ho: HighOrderExtras = step.extras["high_order"]
+        diag: Dict[str, torch.Tensor] = {}
+        tokens: HeadInputs = step.extras["student_tokens"]
+        diag[f"{self.name}/n_centers"] = tokens.node.new_tensor(
+            float(ho.centers.numel())
+        )
+        if ho.centers.numel() < 2:
+            zero = tokens.node.sum() * 0.0
+            diag[f"{self.name}/skipped"] = zero.new_ones(()).detach()
+            diag[f"{self.name}/loss"] = zero.detach()
+            return zero, diag
+        pred, target = self.decode(step)
+        residual = (pred - target).pow(2)
+        loss = residual.mean()
+        with torch.no_grad():
+            spread = (target - target.mean(0)).pow(2)
+            diag[f"{self.name}/r2"] = 1 - residual.sum() / spread.sum().clamp(min=1e-12)
+            for block, cols in ActionResponseTerm.SLICES.items():
+                diag[f"{self.name}/r2_{block}"] = 1 - residual[:, cols].sum() / spread[
+                    :, cols
+                ].sum().clamp(min=1e-12)
+        diag[f"{self.name}/skipped"] = loss.new_zeros(()).detach()
         diag[f"{self.name}/loss"] = loss.detach()
         diag[f"{self.name}/active"] = loss.new_tensor(on)
         return self.weight * on * loss, diag

@@ -24,6 +24,7 @@ DEFAULTS = {
     "second_rotation": False,
     "smooth_rotation": 0.0,
     "smooth_displacement": 0.0,
+    "student_nudge": False,
 }
 
 # term settings: they live in the term entries of ``objective.terms`` only

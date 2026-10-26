@@ -594,6 +594,7 @@ HIGH_ORDER_VIEW_TERMS = (
     "action_response",
     "rotational_smoothness",
     "positional_smoothness",
+    "inverse_response",
 )
 # the terms that read the second student rotation of the high-order views
 SECOND_ROTATION_TERMS = ("equivariant_vicreg", "vicreg_averaged")
@@ -634,6 +635,8 @@ def check_term_combination(hypers: Dict[str, Any]) -> None:
             raise ValueError(
                 f"the '{name}' term needs `high_order.{SMOOTHNESS_TERMS[name]}` > 0"
             )
+    if "inverse_response" in terms and not hypers["high_order"]["student_nudge"]:
+        raise ValueError("the 'inverse_response' term needs `high_order.student_nudge`")
     anti_collapse = [name for name in ANTI_COLLAPSE_TERMS if name in terms]
     if len(anti_collapse) > 1 or (
         len(anti_collapse) == 0 and not hypers["allow_no_anti_collapse"]

@@ -50,6 +50,7 @@ from .high_order.documentation import (
     DeformationJetsTermHypers,
     EquivariantVicregTermHypers,
     HighOrderHypers,
+    InverseResponseTermHypers,
     NonNegativeFloat,
     PositionalSmoothnessTermHypers,
     PositiveFloat,
@@ -227,6 +228,9 @@ class TermsHypers(TypedDict):
     positional_smoothness: NotRequired[Optional[PositionalSmoothnessTermHypers]] = None
     """High-order views: smoothness of the features under a small displacement
     (needs ``high_order.smooth_displacement``)."""
+    inverse_response: NotRequired[Optional[InverseResponseTermHypers]] = None
+    """High-order method, inverse D5: the teacher-mode amplitudes decoded from the
+    student's own response to the nudge views (needs ``high_order.student_nudge``)."""
 
 
 def _at_least_one_term(terms: dict) -> dict:
