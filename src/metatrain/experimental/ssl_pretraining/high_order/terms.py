@@ -1350,7 +1350,9 @@ class InverseResponseTerm(torch.nn.Module):
     target variance, but about 9 decodable directions suffice, so it needs the
     shared anti-collapse term.
 
-    Monitors: ``r2`` (all amplitudes) and ``r2_<block>``, ``n_centers`` and
+    Monitors: ``r2`` (all amplitudes) and ``r2_<block>`` per step (noisy: a step
+    has few centres), ``sse_<block>`` and ``sst_<block>`` (per-step sums, whose
+    epoch averages give the pooled ``1 - sse / sst``), ``n_centers`` and
     ``skipped`` (1 on a step with fewer than two centres).
 
     .. code-block:: python
@@ -1442,6 +1444,11 @@ class InverseResponseTerm(torch.nn.Module):
                 diag[f"{self.name}/r2_{block}"] = 1 - residual[:, cols].sum() / spread[
                     :, cols
                 ].sum().clamp(min=1e-12)
+                # per-step sums: the epoch averages give the pooled R^2,
+                # 1 - sse / sst (a step has only a few centres, so the per-step r2
+                # above is noisy and its average is biased low)
+                diag[f"{self.name}/sse_{block}"] = residual[:, cols].sum()
+                diag[f"{self.name}/sst_{block}"] = spread[:, cols].sum()
         diag[f"{self.name}/skipped"] = loss.new_zeros(()).detach()
         diag[f"{self.name}/loss"] = loss.detach()
         diag[f"{self.name}/active"] = loss.new_tensor(on)

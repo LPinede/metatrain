@@ -85,6 +85,10 @@ def test_inverse_response_term(medium_batch, pet_core, small_teacher):
     loss, diag = term(step)
     assert torch.isfinite(loss) and float(loss.detach()) > 0
     torch.testing.assert_close(loss, 2.0 * diag[f"{term.name}/loss"])
+    # the pooled sums reproduce the per-step R^2 of each block
+    for block in ("dilation", "rotation", "shear"):
+        pooled = 1 - diag[f"{term.name}/sse_{block}"] / diag[f"{term.name}/sst_{block}"]
+        torch.testing.assert_close(pooled, diag[f"{term.name}/r2_{block}"])
     loss.backward()
     grads = [p.grad for p in pet_core.parameters() if p.grad is not None]
     assert grads and any(float(g.abs().sum()) > 0 for g in grads)
